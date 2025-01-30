@@ -1,0 +1,33 @@
+defaults:
+  - _self_
+  - model: cocondenser
+
+seed: 1776
+
+data:
+  format: "json"
+  train_path: "/root/data/msmarco_triplets/msmarco-triplets.jsonl.gz"
+
+batch_size: 4
+num_negatives: 4
+lambda_d: 5e-4
+lambda_q: 5e-4
+T_d: 20000
+T_q: 20000
+top_k_doc: 256
+top_k_query: 64
+epochs: 5
+
+optimizer:
+  learning_rate: 3e-4
+  warmup_steps: 10000
+  every_k_schedule: 4
+
+checkpoint:
+  max_to_keep: 15
+  save_interval_steps: 0
+  checkpoint_path: "checkpoints/cocondensor"
+wandb: False
+wandb_project: "splade-cocondensor"
+log_every: 20
+

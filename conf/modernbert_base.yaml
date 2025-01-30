@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+  - model: modernbert
+
+seed: 1776
+
+data:
+  format: "json"
+  train_path: "/root/data/msmarco_triplets/msmarco-triplets.jsonl.gz"
+
+batch_size: 1
+num_negatives: 2
+lambda_d: 5e-4
+lambda_q: 5e-4
+T_d: 5000
+T_q: 5000
+top_k: 256
+epochs: 10
+
+optimizer:
+  learning_rate: 1e-4
+  warmup_steps: 1000
+  every_k_schedule: 4
+
+checkpoint:
+  max_to_keep: 3
+  save_interval_steps: 40000
+  checkpoint_path: "checkpoints/modernbert"
+wandb: True
+wandb_project: "splade-modernbert"
+log_every: 50
