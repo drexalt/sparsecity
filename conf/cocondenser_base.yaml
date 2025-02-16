@@ -6,8 +6,9 @@ seed: 1776
 
 data:
   format: "json"
-  train_path: "/root/data/msmarco_triplets/msmarco-triplets.jsonl.gz"
+  train_path: "/root/data/msmarco_triplets/msmarco-triplets-scored-fp32.jsonl.gz"
 
+use_distillation: True
 batch_size: 6
 num_negatives: 4
 lambda_d: 5e-4
@@ -26,7 +27,11 @@ checkpoint:
   max_to_keep: 15
   save_interval_steps: 100
   checkpoint_path: "checkpoints/cocondenser"
-wandb: False
+evaluation:
+  eval_every_steps: 200
+  datasets: ["scifact", "quoraretrieval", "msmarco"]
+  batch_size: 32
+wandb: True
 wandb_project: "splade-cocondensor"
 log_every: 20
 

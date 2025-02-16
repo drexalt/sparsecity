@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 from jaxtyping import Float, Int
 import torch
 import torch.nn as nn
@@ -17,6 +17,7 @@ def train_step(
     lambda_t_q: torch.Tensor,
     device: torch.device,
     epsilon: torch.Tensor,
+    teacher_scores: Optional[torch.Tensor] = None,
 ):
     torch.compiler.cudagraph_mark_step_begin()
     model.train()
@@ -70,11 +71,24 @@ def train_step(
         doc_sum_squared + epsilon
     )
 
+    teacher_pos = teacher_scores[:, 0]  # Positive teacher score
+    teacher_neg = teacher_scores[:, 1:]  # Negative teacher scores
+    student_pos = scores[:, 0]  # Positive student score
+    student_neg = scores[:, 1:]  # Negative student scores
+
+    teacher_margins = (
+        teacher_pos.unsqueeze(1) - teacher_neg
+    )  # shape: (batch_size, num_negatives)
+    student_margins = (
+        student_pos.unsqueeze(1) - student_neg
+    )  # shape: (batch_size, num_negatives)
+    margin_mse_loss = F.mse_loss(student_margins, teacher_margins)
+
     # Total loss
-    total_loss = triplet_loss + flops + anti_zero
+    total_loss = triplet_loss + flops + anti_zero + margin_mse_loss
 
     # Backward pass
     total_loss.backward()
     # optimizer.step()
 
-    return total_loss, triplet_loss, flops, anti_zero
+    return total_loss, triplet_loss, margin_mse_loss, flops, anti_zero
