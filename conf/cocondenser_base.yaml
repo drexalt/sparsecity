@@ -11,15 +11,15 @@ data:
 use_distillation: True
 batch_size: 6
 num_negatives: 4
-lambda_d: 5e-4
+lambda_d: 9e-4
 lambda_q: 5e-4
-T_d: 20000
-T_q: 20000
+T_d: 4000
+T_q: 4000
 top_k: 256
 epochs: 5
 
 optimizer:
-  learning_rate: 3e-4
+  learning_rate: 3e-5
   warmup_steps: 1000
   every_k_schedule: 4
 
@@ -28,9 +28,9 @@ checkpoint:
   save_interval_steps: 100
   checkpoint_path: "checkpoints/cocondenser"
 evaluation:
-  eval_every_steps: 200
+  eval_every_steps: 400
   datasets: ["scifact", "quoraretrieval", "msmarco"]
-  batch_size: 32
+  batch_size: 16
 wandb: True
 wandb_project: "splade-cocondensor"
 log_every: 20

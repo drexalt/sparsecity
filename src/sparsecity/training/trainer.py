@@ -17,6 +17,7 @@ def train_step(
     lambda_t_q: torch.Tensor,
     device: torch.device,
     epsilon: torch.Tensor,
+    temperature: torch.Tensor,
     teacher_scores: Optional[torch.Tensor] = None,
 ):
     torch.compiler.cudagraph_mark_step_begin()
@@ -45,8 +46,9 @@ def train_step(
     # Split the embeddings back into queries and documents
     query_embeddings = combined_embeddings[:batch_size]
     doc_embeddings = combined_embeddings[batch_size:].reshape(batch_size, num_docs, -1)
-    scores = torch.sum(query_embeddings.unsqueeze(1) * doc_embeddings, dim=-1)
 
+    scores = torch.sum(query_embeddings.unsqueeze(1) * doc_embeddings, dim=-1)
+    scores = scores / temperature
     # Create labels (assuming first document is positive)
     labels = torch.zeros(batch_size, dtype=torch.long, device=device)
 
@@ -61,16 +63,16 @@ def train_step(
     flops = lambda_t_d * doc_flops + lambda_t_q * query_l1
 
     # Compute anti-zero loss
-    # anti_zero = 1 / (torch.sum(query_embeddings) ** 2 + 1e-8) + 1 / (
-    #     torch.sum(doc_embeddings) ** 2 + 1e-8
+    anti_zero = torch.reciprocal(
+        torch.sum(query_embeddings) ** 2 + 1e-8
+    ) + torch.reciprocal(torch.sum(doc_embeddings) ** 2 + 1e-8)
+    # query_sum_squared = torch.sum(query_embeddings).square()
+    # doc_sum_squared = torch.sum(doc_embeddings).square()
+
+    # anti_zero = 0.1 * (
+    #     torch.log(1 + 1 / (query_sum_squared + 1e-4))
+    #     + torch.log(1 + 1 / (doc_sum_squared + 1e-4))
     # )
-    query_sum_squared = torch.sum(query_embeddings).square()
-    doc_sum_squared = torch.sum(doc_embeddings).square()
-
-    anti_zero = torch.reciprocal(query_sum_squared + epsilon) + torch.reciprocal(
-        doc_sum_squared + epsilon
-    )
-
     teacher_pos = teacher_scores[:, 0]  # Positive teacher score
     teacher_neg = teacher_scores[:, 1:]  # Negative teacher scores
     student_pos = scores[:, 0]  # Positive student score
@@ -85,10 +87,11 @@ def train_step(
     margin_mse_loss = F.mse_loss(student_margins, teacher_margins)
 
     # Total loss
-    total_loss = triplet_loss + flops + anti_zero + margin_mse_loss
+    total_loss = triplet_loss + flops + anti_zero
 
     # Backward pass
     total_loss.backward()
     # optimizer.step()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     return total_loss, triplet_loss, margin_mse_loss, flops, anti_zero
