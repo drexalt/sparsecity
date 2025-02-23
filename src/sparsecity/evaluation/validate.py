@@ -5,18 +5,11 @@ from sentence_transformers.evaluation import NanoBEIREvaluator
 import torch
 
 
-def validate_model(model, tokenizer, cfg, device):
+def validate_model(evaluator, model, tokenizer, device):
     """Run NanoBEIR evaluation on the current model state"""
     # Create temporary wrapper objects
     st_module = ST_SPLADEModule(model, tokenizer, max_length=tokenizer.model_max_length)
     st_model = SentenceTransformer(modules=[st_module]).to(device)
-
-    evaluator = NanoBEIREvaluator(
-        dataset_names=cfg.evaluation.datasets,
-        score_functions={"dot": dot_score},
-        batch_size=cfg.evaluation.batch_size,
-        show_progress_bar=True,
-    )
 
     with torch.inference_mode():
         results = evaluator(st_model)

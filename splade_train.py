@@ -5,6 +5,8 @@ from sparsecity.data.dataset import (
 )
 from sparsecity.models.splade_models.model_registry import get_splade_model
 from sparsecity.evaluation.validate import validate_model
+from sentence_transformers.evaluation import NanoBEIREvaluator
+from sentence_transformers.similarity_functions import dot_score
 from transformers import AutoTokenizer
 import os
 import torch
@@ -60,6 +62,13 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     # Move models to device
     splade_model = splade_model.to(device)
 
+    evaluator = NanoBEIREvaluator(
+        dataset_names=cfg.evaluation.datasets,
+        score_functions={"dot": dot_score},
+        batch_size=cfg.evaluation.batch_size,
+        show_progress_bar=True,
+    )
+
     # Create optimizer and scheduler
     optimizer = heavyball.ForeachPSGDKron(
         splade_model.parameters(),
@@ -104,6 +113,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "batch_size": cfg.batch_size,
                 "learning_rate": cfg.optimizer.learning_rate,
                 "warmup_steps": cfg.optimizer.warmup_steps,
+                "optimizer": optimizer.__class__.__name__,
             },
         )
     os.makedirs(cfg.checkpoint.checkpoint_path, exist_ok=True)
@@ -127,8 +137,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             lambda_t_d = compute_lambda_t(cfg.lambda_d, step_ratio_d)
             lambda_t_q = compute_lambda_t(cfg.lambda_q, step_ratio_q)
-            epsilon = torch.tensor(1e-8, device=device)
             temperature = torch.tensor(10.0, device=device)
+            mse_weight = torch.tensor(0.0, device=device)
             # optimizer.train()
             total_loss, triplet_loss, margin_mse_loss, flops, anti_zero = train_step(
                 splade_model,
@@ -140,8 +150,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 torch.tensor(lambda_t_d, device=device),
                 torch.tensor(lambda_t_q, device=device),
                 device,
-                epsilon,
                 temperature,
+                mse_weight,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
             )
             optimized_step()
@@ -157,7 +167,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             if (step + 1) % cfg.evaluation.eval_every_steps == 0 or step == 5:
                 splade_model.eval()
-                val_results = validate_model(splade_model, tokenizer, cfg, device)
+                val_results = validate_model(evaluator, splade_model, tokenizer, device)
                 splade_model.train()
 
                 if cfg.wandb:
@@ -200,10 +210,8 @@ def main(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
     model = get_splade_model(cfg.model.name)
     dataset = load_dataset(
-        "json",
-        data_files={"train": cfg.data.train_path},
+        "jturner116/msmarco-hard-negatives-scored-stella",
         split="train",
-        encoding="utf-8",
     )
     set_torch()
     train_model(

@@ -16,8 +16,8 @@ def train_step(
     lambda_t_d: torch.Tensor,
     lambda_t_q: torch.Tensor,
     device: torch.device,
-    epsilon: torch.Tensor,
     temperature: torch.Tensor,
+    mse_weight: torch.Tensor,
     teacher_scores: Optional[torch.Tensor] = None,
 ):
     torch.compiler.cudagraph_mark_step_begin()
@@ -63,16 +63,14 @@ def train_step(
     flops = lambda_t_d * doc_flops + lambda_t_q * query_l1
 
     # Compute anti-zero loss
-    anti_zero = torch.reciprocal(
-        torch.sum(query_embeddings) ** 2 + 1e-8
-    ) + torch.reciprocal(torch.sum(doc_embeddings) ** 2 + 1e-8)
-    # query_sum_squared = torch.sum(query_embeddings).square()
-    # doc_sum_squared = torch.sum(doc_embeddings).square()
-
-    # anti_zero = 0.1 * (
-    #     torch.log(1 + 1 / (query_sum_squared + 1e-4))
-    #     + torch.log(1 + 1 / (doc_sum_squared + 1e-4))
-    # )
+    # anti_zero = torch.reciprocal(
+    #     torch.sum(query_embeddings) ** 2 + 1e-8
+    # ) + torch.reciprocal(torch.sum(doc_embeddings) ** 2 + 1e-8)
+    query_sum = torch.sum(torch.abs(query_embeddings))  # L1 norm to avoid cancellation
+    doc_sum = torch.sum(torch.abs(doc_embeddings))
+    anti_zero = 0.1 * (
+        torch.log1p(1.0 / (query_sum + 1e-4)) + torch.log1p(1.0 / (doc_sum + 1e-4))
+    )
     teacher_pos = teacher_scores[:, 0]  # Positive teacher score
     teacher_neg = teacher_scores[:, 1:]  # Negative teacher scores
     student_pos = scores[:, 0]  # Positive student score
@@ -87,7 +85,7 @@ def train_step(
     margin_mse_loss = F.mse_loss(student_margins, teacher_margins)
 
     # Total loss
-    total_loss = triplet_loss + flops + anti_zero
+    total_loss = triplet_loss + flops + anti_zero + (mse_weight * margin_mse_loss)
 
     # Backward pass
     total_loss.backward()
