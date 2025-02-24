@@ -19,16 +19,16 @@ top_k: 256
 epochs: 5
 
 optimizer:
-  learning_rate: 3e-5
+  learning_rate: 3e-6
   warmup_steps: 1000
   every_k_schedule: 4
 
 checkpoint:
   max_to_keep: 15
-  save_interval_steps: 100
+  save_interval_steps: 800
   checkpoint_path: "checkpoints/cocondenser"
 evaluation:
-  eval_every_steps: 400
+  eval_every_steps: 800
   datasets: ["scifact", "quoraretrieval", "msmarco"]
   batch_size: 16
 wandb: True

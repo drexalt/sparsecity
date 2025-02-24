@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@torch.compile(mode="max-autotune")
+@torch.compile(mode="default")
 def train_step(
     model: nn.Module,
     query_input_ids: torch.Tensor,
@@ -19,7 +19,7 @@ def train_step(
     temperature: torch.Tensor,
     mse_weight: torch.Tensor,
     teacher_scores: Optional[torch.Tensor] = None,
-):
+) -> Dict[str, torch.Tensor]:
     torch.compiler.cudagraph_mark_step_begin()
     model.train()
     # optimizer.zero_grad()
@@ -90,6 +90,33 @@ def train_step(
     # Backward pass
     total_loss.backward()
     # optimizer.step()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-    return total_loss, triplet_loss, margin_mse_loss, flops, anti_zero
+    metrics = {}
+
+    metrics["loss"] = total_loss
+    metrics["triplet_loss"] = triplet_loss
+    metrics["margin_mse_loss"] = margin_mse_loss
+    metrics["flops_loss"] = flops
+    metrics["anti_zero_loss"] = anti_zero
+
+    metrics["query_sparsity"] = (query_embeddings == 0).float().mean()
+    metrics["doc_sparsity"] = (doc_embeddings == 0).float().mean()
+
+    query_non_zero_vals = query_embeddings[query_embeddings != 0]
+    doc_non_zero_vals = doc_embeddings[doc_embeddings != 0]
+
+    metrics["query_min_non_zero"] = (
+        query_non_zero_vals.abs().min()
+        if query_non_zero_vals.numel() > 0
+        else torch.tensor(0.0, device=device)
+    )
+    metrics["doc_min_non_zero"] = (
+        doc_non_zero_vals.abs().min()
+        if doc_non_zero_vals.numel() > 0
+        else torch.tensor(0.0, device=device)
+    )
+
+    metrics["query_non_zero_count"] = query_non_zero_vals.numel()
+    metrics["doc_non_zero_count"] = doc_non_zero_vals.numel()
+
+    return metrics

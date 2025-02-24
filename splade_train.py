@@ -19,6 +19,7 @@ import hydra
 from omegaconf import DictConfig
 from schedulefree import AdamWScheduleFree
 import heavyball
+from heavyball.utils import trust_region_clip_, rmsnorm_clip_
 from heavyball.utils import set_torch
 
 torch.set_float32_matmul_precision("high")
@@ -77,6 +78,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         caution=True,
         foreach=True,
         delayed=True,
+        gradient_clipping=trust_region_clip_,
+        update_clipping=rmsnorm_clip_,
     )
     # optimizer = AdamWScheduleFree(
     #     splade_model.parameters(),
@@ -140,7 +143,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             temperature = torch.tensor(10.0, device=device)
             mse_weight = torch.tensor(0.0, device=device)
             # optimizer.train()
-            total_loss, triplet_loss, margin_mse_loss, flops, anti_zero = train_step(
+            metrics = train_step(
                 splade_model,
                 query_ids,
                 query_mask,
@@ -156,11 +159,17 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             )
             optimized_step()
             metrics = {
-                "total_loss": total_loss.item(),
-                "triplet_loss": triplet_loss.item(),
-                "margin_mse_loss": margin_mse_loss.item(),
-                "flops": flops.item(),
-                "anti_zero": anti_zero.item(),
+                "total_loss": metrics["loss"].item(),
+                "triplet_loss": metrics["triplet_loss"].item(),
+                "margin_mse_loss": metrics["margin_mse_loss"].item(),
+                "flops": metrics["flops_loss"].item(),
+                "anti_zero": metrics["anti_zero_loss"].item(),
+                "query_sparsity": metrics["query_sparsity"].item(),
+                "doc_sparsity": metrics["doc_sparsity"].item(),
+                "query_min_non_zero": metrics["query_min_non_zero"].item(),
+                "doc_min_non_zero": metrics["doc_min_non_zero"].item(),
+                "query_non_zero_count": metrics["query_non_zero_count"],
+                "doc_non_zero_count": metrics["doc_non_zero_count"],
             }
             if cfg.wandb and step % cfg.log_every == 0:
                 wandb.log({**metrics}, step=step)
