@@ -96,6 +96,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             batch_size=cfg.batch_size,
             shuffle=True,
             pin_memory=True,
+            # num_workers=4,  # Add multiple workers for better data loading
+            # persistent_workers=True,  # Keep workers alive between iterations
         )
     else:
         dataloader = DataLoader(
@@ -106,6 +108,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             batch_size=cfg.batch_size,
             shuffle=True,
             pin_memory=True,
+            # num_workers=4,  # Add multiple workers for better data loading
+            # persistent_workers=True,  # Keep workers alive between iterations
         )
 
     # Initialize wandb if enabled
@@ -168,8 +172,10 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "doc_sparsity": metrics["doc_sparsity"].item(),
                 "query_min_non_zero": metrics["query_min_non_zero"].item(),
                 "doc_min_non_zero": metrics["doc_min_non_zero"].item(),
-                "query_non_zero_count": metrics["query_non_zero_count"],
-                "doc_non_zero_count": metrics["doc_non_zero_count"],
+                "avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
+                "avg_doc_non_zero_count": metrics["avg_doc_non_zero_count"],
+                "query_median_non_zero": metrics["query_median_non_zero"].item(),
+                "doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
             if cfg.wandb and step % cfg.log_every == 0:
                 wandb.log({**metrics}, step=step)

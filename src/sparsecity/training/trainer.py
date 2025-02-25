@@ -63,14 +63,16 @@ def train_step(
     flops = lambda_t_d * doc_flops + lambda_t_q * query_l1
 
     # Compute anti-zero loss
-    # anti_zero = torch.reciprocal(
-    #     torch.sum(query_embeddings) ** 2 + 1e-8
-    # ) + torch.reciprocal(torch.sum(doc_embeddings) ** 2 + 1e-8)
-    query_sum = torch.sum(torch.abs(query_embeddings))  # L1 norm to avoid cancellation
-    doc_sum = torch.sum(torch.abs(doc_embeddings))
-    anti_zero = 0.1 * (
-        torch.log1p(1.0 / (query_sum + 1e-4)) + torch.log1p(1.0 / (doc_sum + 1e-4))
+    anti_zero = torch.clamp(
+        torch.reciprocal(torch.sum(query_embeddings) ** 2 + 1e-8)
+        + torch.reciprocal(torch.sum(doc_embeddings) ** 2 + 1e-8),
+        max=1.0,
     )
+    # query_sum = torch.sum(torch.abs(query_embeddings))  # L1 norm to avoid cancellation
+    # doc_sum = torch.sum(torch.abs(doc_embeddings))
+    # anti_zero = torch.log1p(1.0 / (query_sum + 1e-4)) + torch.log1p(
+    #     1.0 / (doc_sum + 1e-4)
+    # )
     teacher_pos = teacher_scores[:, 0]  # Positive teacher score
     teacher_neg = teacher_scores[:, 1:]  # Negative teacher scores
     student_pos = scores[:, 0]  # Positive student score
@@ -115,8 +117,23 @@ def train_step(
         if doc_non_zero_vals.numel() > 0
         else torch.tensor(0.0, device=device)
     )
+    metrics["query_median_non_zero"] = (
+        torch.median(query_non_zero_vals.abs())
+        if query_non_zero_vals.numel() > 0
+        else torch.tensor(0.0, device=device)
+    )
+    metrics["doc_median_non_zero"] = (
+        torch.median(doc_non_zero_vals.abs())
+        if doc_non_zero_vals.numel() > 0
+        else torch.tensor(0.0, device=device)
+    )
 
-    metrics["query_non_zero_count"] = query_non_zero_vals.numel()
-    metrics["doc_non_zero_count"] = doc_non_zero_vals.numel()
+    metrics["avg_query_non_zero_count"] = query_non_zero_vals.numel() / batch_size
+    metrics["avg_doc_non_zero_count"] = doc_non_zero_vals.numel() / (
+        batch_size * num_docs
+    )
+
+    # metrics["query_non_zero_count"] = query_non_zero_vals.numel()
+    # metrics["doc_non_zero_count"] = doc_non_zero_vals.numel()
 
     return metrics
