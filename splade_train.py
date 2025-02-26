@@ -145,7 +145,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             lambda_t_d = compute_lambda_t(cfg.lambda_d, step_ratio_d)
             lambda_t_q = compute_lambda_t(cfg.lambda_q, step_ratio_q)
             temperature = torch.tensor(10.0, device=device)
-            mse_weight = torch.tensor(0.0, device=device)
+            mse_weight = torch.tensor(0.1, device=device)
             # optimizer.train()
             metrics = train_step(
                 splade_model,
@@ -178,7 +178,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
             if cfg.wandb and step % cfg.log_every == 0:
-                wandb.log({**metrics}, step=step)
+                wandb.log({**metrics}, step=(epoch * len(dataloader)) + step)
 
             if (step + 1) % cfg.evaluation.eval_every_steps == 0 or step == 5:
                 splade_model.eval()
@@ -198,7 +198,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                                 if k not in ["ndcg@10", "mrr@10", "map@100"]
                             },
                         },
-                        step=step,
+                        step=(epoch * len(dataloader)) + step,
                     )
 
             # Save checkpoint
