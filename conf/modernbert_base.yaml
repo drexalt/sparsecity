@@ -20,15 +20,15 @@ epochs: 5
 
 optimizer:
   learning_rate: 3e-6
-  warmup_steps: 1000
+  warmup_steps: 3000
   every_k_schedule: 4
 
 checkpoint:
-  max_to_keep: 15
+  max_to_keep: 5
   save_interval_steps: 800
   checkpoint_path: "checkpoints/modernbert"
 evaluation:
-  eval_every_steps: 800
+  eval_every_steps: 400
   datasets: ["scifact", "quoraretrieval", "msmarco"]
   batch_size: 16
 wandb: True

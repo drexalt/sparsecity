@@ -21,6 +21,7 @@ from schedulefree import AdamWScheduleFree
 import heavyball
 from heavyball.utils import trust_region_clip_, rmsnorm_clip_
 from heavyball.utils import set_torch
+from heapq import heappush, heappop, heapreplace
 
 torch.set_float32_matmul_precision("high")
 torch._dynamo.reset()
@@ -46,6 +47,57 @@ class TrainingConfig:
     wandb_project: str
     use_distillation: bool
     evaluation: DictConfig
+
+
+def save_checkpoint(
+    step: int,
+    score: float,
+    splade_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str,
+) -> str:
+    checkpoint = {
+        "splade_model": splade_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "ndcg@10": score,
+    }
+    filepath = os.path.join(
+        checkpoint_path, f"checkpoint_step_{step}_ndcg_{score:.4f}.pt"
+    )
+    torch.save(checkpoint, filepath)
+    return filepath
+
+
+def update_checkpoint_tracking(
+    step: int,
+    score: float,
+    checkpoint_scores: list,
+    max_checkpoints: int,
+    splade_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str,
+) -> list:
+    # Create a new list to maintain purity
+    updated_checkpoint_scores = checkpoint_scores.copy()
+
+    if len(updated_checkpoint_scores) < max_checkpoints:
+        filepath = save_checkpoint(
+            step, score, splade_model, optimizer, checkpoint_path
+        )
+        heappush(updated_checkpoint_scores, (score, step, filepath))
+    elif score > updated_checkpoint_scores[0][0]:  # Compare with lowest score
+        # Remove lowest scoring checkpoint
+        _, old_step, old_filepath = heappop(updated_checkpoint_scores)
+        if os.path.exists(old_filepath):
+            os.remove(old_filepath)
+        # Save new checkpoint
+        filepath = save_checkpoint(
+            step, score, splade_model, optimizer, checkpoint_path
+        )
+        heappush(updated_checkpoint_scores, (score, step, filepath))
+
+    return updated_checkpoint_scores
 
 
 def compute_lambda_t(lambda_val: float, step_ratio: float) -> float:
@@ -96,8 +148,9 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             batch_size=cfg.batch_size,
             shuffle=True,
             pin_memory=True,
-            # num_workers=4,  # Add multiple workers for better data loading
-            # persistent_workers=True,  # Keep workers alive between iterations
+            num_workers=4,  # Add multiple workers for better data loading
+            persistent_workers=True,  # Keep workers alive between iterations
+            prefetch_factor=2,
         )
     else:
         dataloader = DataLoader(
@@ -108,8 +161,9 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             batch_size=cfg.batch_size,
             shuffle=True,
             pin_memory=True,
-            # num_workers=4,  # Add multiple workers for better data loading
-            # persistent_workers=True,  # Keep workers alive between iterations
+            num_workers=4,  # Add multiple workers for better data loading
+            persistent_workers=True,  # Keep workers alive between iterations
+            prefetch_factor=2,
         )
 
     # Initialize wandb if enabled
@@ -124,6 +178,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             },
         )
     os.makedirs(cfg.checkpoint.checkpoint_path, exist_ok=True)
+    checkpoint_scores = []
 
     def optimized_step():
         optimizer.step()
@@ -201,21 +256,15 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                         step=(epoch * len(dataloader)) + step,
                     )
 
-            # Save checkpoint
-            if (
-                cfg.checkpoint.save_interval_steps > 0
-                and step % cfg.checkpoint.save_interval_steps == 0
-            ):
-                checkpoint = {
-                    "splade_model": splade_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                }
-                torch.save(
-                    checkpoint,
-                    os.path.join(
-                        cfg.checkpoint.checkpoint_path, f"checkpoint_{step}.pt"
-                    ),
+                # Save checkpoint
+                checkpoint_scores = update_checkpoint_tracking(
+                    step=(epoch * len(dataloader)) + step,
+                    score=val_results["ndcg@10"],
+                    checkpoint_scores=checkpoint_scores,
+                    max_checkpoints=cfg.checkpoint.max_to_keep,
+                    splade_model=splade_model,
+                    optimizer=optimizer,
+                    checkpoint_path=cfg.checkpoint.checkpoint_path,
                 )
 
 

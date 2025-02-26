@@ -24,7 +24,7 @@ optimizer:
   every_k_schedule: 4
 
 checkpoint:
-  max_to_keep: 15
+  max_to_keep: 5
   save_interval_steps: 800
   checkpoint_path: "checkpoints/cocondenser"
 evaluation:
