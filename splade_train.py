@@ -202,20 +202,21 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             temperature = torch.tensor(10.0, device=device)
             mse_weight = torch.tensor(0.1, device=device)
             # optimizer.train()
-            metrics = train_step(
-                splade_model,
-                query_ids,
-                query_mask,
-                doc_ids,
-                doc_mask,
-                cfg.top_k,
-                torch.tensor(lambda_t_d, device=device),
-                torch.tensor(lambda_t_q, device=device),
-                device,
-                temperature,
-                mse_weight,
-                teacher_scores=teacher_scores if cfg.use_distillation else None,
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                metrics = train_step(
+                    splade_model,
+                    query_ids,
+                    query_mask,
+                    doc_ids,
+                    doc_mask,
+                    cfg.top_k,
+                    torch.tensor(lambda_t_d, device=device),
+                    torch.tensor(lambda_t_q, device=device),
+                    device,
+                    temperature,
+                    mse_weight,
+                    teacher_scores=teacher_scores if cfg.use_distillation else None,
+                )
             optimized_step()
             metrics = {
                 "total_loss": metrics["loss"].item(),
