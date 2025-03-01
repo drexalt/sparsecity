@@ -127,6 +127,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         warmup_steps=cfg.optimizer.warmup_steps,
+        weight_decay=cfg.optimizer.weight_decay,
         caution=True,
         foreach=True,
         delayed=True,

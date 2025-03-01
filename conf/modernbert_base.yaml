@@ -13,16 +13,16 @@ batch_size: 12
 num_negatives: 8
 lambda_d: 9e-4
 lambda_q: 5e-4
-T_d: 4000
-T_q: 4000
+T_d: 8000
+T_q: 8000
 top_k: 256
 epochs: 5
 
 optimizer:
   learning_rate: 3e-6
-  warmup_steps: 3000
+  warmup_steps: 2000
   every_k_schedule: 4
-
+  weight_decay: 0.01
 checkpoint:
   max_to_keep: 5
   save_interval_steps: 800
