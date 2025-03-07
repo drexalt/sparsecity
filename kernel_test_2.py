@@ -10,7 +10,7 @@ from hydra import compose, initialize
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from sparsecity.models.splade_models.model_registry import get_splade_model
 from sparsecity.models.splade_models.splade import SpladeModel
-from sparsecity.data.dataset import MultipleNegativesCollateFn
+from sparsecity.data.dataset import MultipleNegativesDistilCollateFn
 from torch.utils.data import DataLoader
 
 
@@ -193,15 +193,10 @@ class MemoryEfficientSplade(nn.Module):
 
 if __name__ == "__main__":
     # Dataset and configuration setup
-    text_only = load_dataset(
-        "json",
-        data_files={
-            "train": "/root/data/msmarco_triplets/msmarco-triplets-stella.jsonl.gz"
-        },
+    dataset = load_dataset(
+        "jturner116/msmarco-hard-negatives-scored-stella",
         split="train",
-        encoding="utf-8",
     )
-
     initialize(config_path="conf", version_base=None)
     cfg = compose(config_name="modernbert_base")
 
@@ -217,8 +212,8 @@ if __name__ == "__main__":
     custom_kernel_model = MemoryEfficientSplade(model).to(device)
 
     dataloader = DataLoader(
-        text_only,
-        collate_fn=MultipleNegativesCollateFn(tokenizer, num_negatives=4),
+        dataset,
+        collate_fn=MultipleNegativesDistilCollateFn(tokenizer, num_negatives=4),
         batch_size=4,
         shuffle=False,
         pin_memory=True,
