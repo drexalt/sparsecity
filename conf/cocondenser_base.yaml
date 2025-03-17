@@ -12,6 +12,7 @@ use_distillation: True
 custom_kernel: True
 batch_size: 4
 num_negatives: 6
+max_length: 256
 lambda_d: 9e-4
 lambda_q: 5e-4
 T_d: 8000

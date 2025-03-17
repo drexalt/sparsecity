@@ -35,6 +35,7 @@ class TrainingConfig:
     custom_kernel: bool
     batch_size: int
     num_negatives: int
+    max_length: int
     lambda_d: float
     lambda_q: float
     T_d: float
@@ -141,6 +142,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     #     warmup_steps=cfg.optimizer.warmup_steps,
     # )
     # optimizer.train()
+    if cfg.max_length is not None:
+        tokenizer.model_max_length = cfg.max_length
     if cfg.use_distillation:
         dataloader = DataLoader(
             dataset,
