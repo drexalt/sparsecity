@@ -5,10 +5,11 @@ defaults:
 seed: 1776
 
 data:
-  format: "json"
-  train_path: "/root/data/msmarco_triplets/msmarco-triplets-scored-fp32.jsonl.gz"
+  name: "jturner116/msmarco-hard-negatives-scored-stella"
+  split: "train"
 
 use_distillation: True
+custom_kernel: True
 batch_size: 12
 num_negatives: 8
 lambda_d: 9e-4

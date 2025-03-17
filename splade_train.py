@@ -277,8 +277,8 @@ def main(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
     model = get_splade_model(cfg.model.name, custom_kernel=cfg.custom_kernel)
     dataset = load_dataset(
-        "jturner116/msmarco-hard-negatives-scored-stella",
-        split="train",
+        cfg.data.name,
+        split=cfg.data.split,
     )
     set_torch()
     train_model(
