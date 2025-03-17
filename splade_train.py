@@ -32,6 +32,7 @@ class TrainingConfig:
     seed: int
     data: DictConfig
     model: DictConfig
+    custom_kernel: bool
     batch_size: int
     num_negatives: int
     lambda_d: float
@@ -203,21 +204,21 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             temperature = torch.tensor(10.0, device=device)
             mse_weight = torch.tensor(0.1, device=device)
             # optimizer.train()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                metrics = train_step(
-                    splade_model,
-                    query_ids,
-                    query_mask,
-                    doc_ids,
-                    doc_mask,
-                    cfg.top_k,
-                    torch.tensor(lambda_t_d, device=device),
-                    torch.tensor(lambda_t_q, device=device),
-                    device,
-                    temperature,
-                    mse_weight,
-                    teacher_scores=teacher_scores if cfg.use_distillation else None,
-                )
+            # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            metrics = train_step(
+                splade_model,
+                query_ids,
+                query_mask,
+                doc_ids,
+                doc_mask,
+                cfg.top_k,
+                torch.tensor(lambda_t_d, device=device),
+                torch.tensor(lambda_t_q, device=device),
+                device,
+                temperature,
+                mse_weight,
+                teacher_scores=teacher_scores if cfg.use_distillation else None,
+            )
             optimized_step()
             metrics = {
                 "total_loss": metrics["loss"].item(),
@@ -270,11 +271,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 )
 
 
-@hydra.main(config_path="conf", config_name="distilbert_base", version_base=None)
+@hydra.main(config_path="conf", config_name="cocondenser_base", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
-    model = get_splade_model(cfg.model.name)
+    model = get_splade_model(cfg.model.name, custom_kernel=cfg.custom_kernel)
     dataset = load_dataset(
         "jturner116/msmarco-hard-negatives-scored-stella",
         split="train",

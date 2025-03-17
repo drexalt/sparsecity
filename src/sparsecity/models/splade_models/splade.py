@@ -78,7 +78,7 @@ class SpladeModel(nn.Module):
         threshold = top_values[..., -1, None]
         values = values * (values >= threshold)
 
-        return values, logits
+        return values
 
 
 class SpladeModel_NoTopK(nn.Module):
