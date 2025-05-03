@@ -1,14 +1,21 @@
-from .st_wrapper import ST_SPLADEModule
+from .st_wrapper import ST_SPLADEModule, ST_SparseEmbedModule
 from sentence_transformers.similarity_functions import dot_score
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.evaluation import NanoBEIREvaluator
 import torch
 
 
-def validate_model(evaluator, model, tokenizer, device):
+def validate_model(evaluator, model, tokenizer, device, sparse_embed: bool = False):
     """Run NanoBEIR evaluation on the current model state"""
     # Create temporary wrapper objects
-    st_module = ST_SPLADEModule(model, tokenizer, max_length=tokenizer.model_max_length)
+    if sparse_embed:
+        st_module = ST_SparseEmbedModule(
+            model, tokenizer, max_length=tokenizer.model_max_length
+        )
+    else:
+        st_module = ST_SPLADEModule(
+            model, tokenizer, max_length=tokenizer.model_max_length
+        )
     st_model = SentenceTransformer(modules=[st_module]).to(device)
 
     with torch.inference_mode():

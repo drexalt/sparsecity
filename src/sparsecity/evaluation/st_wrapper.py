@@ -62,6 +62,72 @@ class ST_SPLADEModule(nn.Module):
         return outputs["doc_embedding"].cpu().numpy()
 
 
+class ST_SparseEmbedModule(nn.Module):
+    def __init__(self, sparse_embed_model, tokenizer, max_length=256):
+        """
+        Wrapper for SparseEmbedModel to make it compatible with SentenceTransformer evaluation.
+
+        :param sparse_embed_model: A SparseEmbedModel instance.
+        :param tokenizer: The corresponding AutoTokenizer.
+        :param max_length: Maximum sequence length for tokenization.
+        """
+        super().__init__()
+        self.sparse_embed_model = sparse_embed_model
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def forward(self, features: dict) -> dict:
+        """
+        Receives tokenized features and returns a dict with "sentence_embedding".
+        The "sentence_embedding" is set to the "sparse_activations" from the SparseEmbedModel.
+        """
+        model_inputs = {
+            "input_ids": features["input_ids"],
+            "attention_mask": features["attention_mask"],
+        }
+        device = next(self.sparse_embed_model.parameters()).device
+        model_inputs = {key: value.to(device) for key, value in model_inputs.items()}
+
+        self.sparse_embed_model.eval()
+        with torch.inference_mode():
+            output_dict = self.sparse_embed_model(**model_inputs)
+
+        sentence_embedding = output_dict["sparse_activations"]
+        features["sentence_embedding"] = sentence_embedding.cpu()
+        return features
+
+    def tokenize(self, texts):
+        """
+        Tokenizes raw texts for the SparseEmbedModel model.
+        """
+        return self.tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+    def encode(self, texts, batch_size=32, **kwargs):
+        """
+        Produces sparse embeddings (sparse_activations) for a list of texts.
+        """
+        all_sparse_activations = []
+        for start_index in range(0, len(texts), batch_size):
+            texts_batch = texts[start_index : start_index + batch_size]
+            inputs = self.tokenize(texts_batch)
+            device = next(self.sparse_embed_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            self.sparse_embed_model.eval()
+            with torch.inference_mode():
+                output_dict = self.sparse_embed_model(**inputs)
+
+            all_sparse_activations.append(output_dict["sparse_activations"].cpu())
+
+        return torch.cat(all_sparse_activations, dim=0).numpy()
+
+
 class ST_SPLADEV3Module(nn.Module):
     def __init__(self, splade_model, tokenizer, max_length=256):
         """
