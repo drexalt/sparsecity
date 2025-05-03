@@ -1,4 +1,7 @@
-from sparsecity.training.trainer import train_step
+# from sparsecity.training.trainer import train_step
+from sparsecity.training.trainer import train_step_kldiv_ibn
+
+# from sparsecity.training.sparse_trainer import train_step
 from sparsecity.data.dataset import (
     MultipleNegativesCollateFn,
     MultipleNegativesDistilCollateFn,
@@ -17,11 +20,11 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig
-from schedulefree import AdamWScheduleFree
 import heavyball
+
 from heavyball.utils import trust_region_clip_, rmsnorm_clip_
 from heavyball.utils import set_torch
-from heapq import heappush, heappop, heapreplace
+from heapq import heappush, heappop
 
 torch.set_float32_matmul_precision("high")
 torch._dynamo.reset()
@@ -32,6 +35,7 @@ class TrainingConfig:
     seed: int
     data: DictConfig
     model: DictConfig
+    sparse_embed: bool
     custom_kernel: bool
     batch_size: int
     num_negatives: int
@@ -136,12 +140,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         gradient_clipping=trust_region_clip_,
         update_clipping=rmsnorm_clip_,
     )
-    # optimizer = AdamWScheduleFree(
+    # optimizer = heavyball.ForeachSFAdamW(
     #     splade_model.parameters(),
     #     lr=cfg.optimizer.learning_rate,
     #     warmup_steps=cfg.optimizer.warmup_steps,
+    #     weight_decay=cfg.optimizer.weight_decay,
+    #     foreach=True,
+    #     caution=True,
     # )
-    # optimizer.train()
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
     if cfg.use_distillation:
@@ -180,6 +186,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "learning_rate": cfg.optimizer.learning_rate,
                 "warmup_steps": cfg.optimizer.warmup_steps,
                 "optimizer": optimizer.__class__.__name__,
+                "sparse_embed": cfg.sparse_embed,
             },
         )
     os.makedirs(cfg.checkpoint.checkpoint_path, exist_ok=True)
@@ -204,11 +211,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             lambda_t_d = compute_lambda_t(cfg.lambda_d, step_ratio_d)
             lambda_t_q = compute_lambda_t(cfg.lambda_q, step_ratio_q)
-            temperature = torch.tensor(10.0, device=device)
+            temperature = torch.tensor(5.0, device=device)
             mse_weight = torch.tensor(0.1, device=device)
             # optimizer.train()
             # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            metrics = train_step(
+            metrics = train_step_kldiv_ibn(
                 splade_model,
                 query_ids,
                 query_mask,
@@ -219,31 +226,53 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 torch.tensor(lambda_t_q, device=device),
                 device,
                 temperature,
-                mse_weight,
+                neg_mode="batch",
+                mini_batch=16,
+                # mse_weight,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
             )
             optimized_step()
             metrics = {
-                "total_loss": metrics["loss"].item(),
-                "triplet_loss": metrics["triplet_loss"].item(),
-                "margin_mse_loss": metrics["margin_mse_loss"].item(),
-                "flops": metrics["flops_loss"].item(),
-                "anti_zero": metrics["anti_zero_loss"].item(),
-                "query_sparsity": metrics["query_sparsity"].item(),
-                "doc_sparsity": metrics["doc_sparsity"].item(),
-                "query_min_non_zero": metrics["query_min_non_zero"].item(),
-                "doc_min_non_zero": metrics["doc_min_non_zero"].item(),
-                "avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
-                "avg_doc_non_zero_count": metrics["avg_doc_non_zero_count"],
-                "query_median_non_zero": metrics["query_median_non_zero"].item(),
-                "doc_median_non_zero": metrics["doc_median_non_zero"].item(),
+                "loss/total_loss": metrics["loss"].item(),
+                "loss/triplet_loss": metrics["triplet_loss"].item(),
+                "loss/kl_loss": metrics["kl_loss"].item(),
+                "loss/flops": metrics["flops_loss"].item(),
+                "loss/anti_zero": metrics["anti_zero_loss"].item(),
+                "metrics/query_sparsity": metrics["query_sparsity"].item(),
+                "metrics/doc_sparsity": metrics["doc_sparsity"].item(),
+                "metrics/query_min_non_zero": metrics["query_min_non_zero"].item(),
+                "metrics/doc_min_non_zero": metrics["doc_min_non_zero"].item(),
+                "metrics/avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
+                "metrics/avg_doc_non_zero_count": metrics["avg_doc_non_zero_count"],
+                "metrics/query_median_non_zero": metrics[
+                    "query_median_non_zero"
+                ].item(),
+                "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
+            # metrics = {
+            #     "total_loss": metrics["total_loss"].item(),
+            #     "triplet_loss": metrics["triplet_loss"].item(),
+            #     "dense_loss": metrics["dense_loss"].item(),
+            #     "sparse_mse_loss": metrics["sparse_mse_loss"].item(),
+            #     "dense_mse_loss": metrics["dense_mse_loss"].item(),
+            #     "flops_loss": metrics["flops_loss"].item(),
+            #     "anti_zero_loss": metrics["anti_zero_loss"].item(),
+            #     "query_sparsity": metrics["query_sparsity"].item(),
+            #     "doc_sparsity": metrics["doc_sparsity"].item(),
+            #     "avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
+            # }
             if cfg.wandb and step % cfg.log_every == 0:
                 wandb.log({**metrics}, step=(epoch * len(dataloader)) + step)
 
             if (step + 1) % cfg.evaluation.eval_every_steps == 0 or step == 5:
                 splade_model.eval()
-                val_results = validate_model(evaluator, splade_model, tokenizer, device)
+                val_results = validate_model(
+                    evaluator,
+                    splade_model,
+                    tokenizer,
+                    device,
+                    sparse_embed=cfg.sparse_embed,
+                )
                 splade_model.train()
 
                 if cfg.wandb:
@@ -278,7 +307,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
-    model = get_splade_model(cfg.model.name, custom_kernel=cfg.custom_kernel)
+    model = get_splade_model(
+        cfg.model.name,
+        custom_kernel=cfg.custom_kernel,
+        sparse_embed=cfg.sparse_embed,
+        checkpoint_path=cfg.model.checkpoint_path
+        if cfg.model.checkpoint_path
+        else None,
+    )
     dataset = load_dataset(
         cfg.data.name,
         split=cfg.data.split,

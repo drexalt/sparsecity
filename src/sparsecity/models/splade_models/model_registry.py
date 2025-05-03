@@ -1,12 +1,15 @@
 from transformers import AutoModelForMaskedLM
-from .splade import SpladeModel
+from .splade import SpladeModel, SparseEmbedModel
 from .memory_efficient import MemoryEfficientSplade
+import torch
 
 
 def get_splade_model(
     model_name: str = "bert-base-uncased",
     device: str = "cuda",
+    sparse_embed: bool = False,
     custom_kernel: bool = False,
+    checkpoint_path: str = None,
 ) -> SpladeModel:
     """
     Get a SPLADE model based on a pretrained transformer model.
@@ -18,8 +21,28 @@ def get_splade_model(
     Returns:
         SpladeModel instance
     """
+
     transformer_model = AutoModelForMaskedLM.from_pretrained(model_name)
-    if custom_kernel:
+    if checkpoint_path:
+        temp = torch.load(checkpoint_path, weights_only=False)
+        state_dict = temp["splade_model"]
+        model_keys = set(transformer_model.state_dict().keys())
+
+        encoder_state_dict = {
+            k.replace("encoder.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("encoder.") and k.replace("encoder.", "") in model_keys
+        }
+        try:
+            transformer_model.load_state_dict(encoder_state_dict)
+        except Exception as e:
+            print(f"Error loading state_dict: {e}")
+            print(f"Model keys: {model_keys}")
+            print(f"State dict keys: {state_dict.keys()}")
+
+    if sparse_embed:
+        splade_model = SparseEmbedModel(transformer_model).to(device)
+    elif custom_kernel:
         splade_model = MemoryEfficientSplade(transformer_model).to(device)
     else:
         splade_model = SpladeModel(transformer_model).to(device)
