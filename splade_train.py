@@ -129,17 +129,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     )
 
     # Create optimizer and scheduler
-    optimizer = heavyball.ForeachPSGDKron(
-        splade_model.parameters(),
-        lr=cfg.optimizer.learning_rate,
-        warmup_steps=cfg.optimizer.warmup_steps,
-        weight_decay=cfg.optimizer.weight_decay,
-        caution=True,
-        foreach=True,
-        delayed=True,
-        gradient_clipping=trust_region_clip_,
-        update_clipping=rmsnorm_clip_,
-    )
+
     # optimizer = heavyball.ForeachSFAdamW(
     #     splade_model.parameters(),
     #     lr=cfg.optimizer.learning_rate,
@@ -147,7 +137,18 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     #     weight_decay=cfg.optimizer.weight_decay,
     #     foreach=True,
     #     caution=True,
+    #     gradient_clipping=trust_region_clip_,
+    #     update_clipping=rmsnorm_clip_,
     # )
+    optimizer = heavyball.ForeachSOAP(
+        splade_model.parameters(),
+        lr=cfg.optimizer.learning_rate,
+        warmup_steps=cfg.optimizer.warmup_steps,
+        weight_decay=cfg.optimizer.weight_decay,
+        foreach=True,
+        gradient_clipping=trust_region_clip_,
+        update_clipping=rmsnorm_clip_,
+    )
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
     if cfg.use_distillation:
@@ -215,6 +216,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             mse_weight = torch.tensor(0.1, device=device)
             # optimizer.train()
             # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+
             metrics = train_step_kldiv_ibn(
                 splade_model,
                 query_ids,
@@ -227,10 +229,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 device,
                 temperature,
                 neg_mode="batch",
-                mini_batch=16,
+                mini_batch=4,
                 # mse_weight,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
             )
+
             optimized_step()
             metrics = {
                 "loss/total_loss": metrics["loss"].item(),
@@ -249,6 +252,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 ].item(),
                 "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
+
             # metrics = {
             #     "total_loss": metrics["total_loss"].item(),
             #     "triplet_loss": metrics["triplet_loss"].item(),
