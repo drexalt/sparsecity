@@ -38,6 +38,7 @@ class TrainingConfig:
     sparse_embed: bool
     custom_kernel: bool
     batch_size: int
+    mini_batch: int
     num_negatives: int
     max_length: int
     lambda_d: float
@@ -184,6 +185,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             project=cfg.wandb_project,
             config={
                 "batch_size": cfg.batch_size,
+                "mini_batch": cfg.mini_batch,
                 "learning_rate": cfg.optimizer.learning_rate,
                 "warmup_steps": cfg.optimizer.warmup_steps,
                 "optimizer": optimizer.__class__.__name__,
@@ -197,6 +199,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+    global_step = 0
+
     # Training loop
     for epoch in range(cfg.epochs):
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
@@ -207,8 +211,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             else:
                 query_ids, query_mask, doc_ids, doc_mask = (t.to(device) for t in batch)
 
-            step_ratio_d = (step + 1) / (cfg.T_d + 1)
-            step_ratio_q = (step + 1) / (cfg.T_q + 1)
+            step_ratio_d = (global_step + 1) / (cfg.T_d + 1)
+            step_ratio_q = (global_step + 1) / (cfg.T_q + 1)
 
             lambda_t_d = compute_lambda_t(cfg.lambda_d, step_ratio_d)
             lambda_t_q = compute_lambda_t(cfg.lambda_q, step_ratio_q)
@@ -229,7 +233,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 device,
                 temperature,
                 neg_mode="batch",
-                mini_batch=4,
+                mini_batch=cfg.mini_batch,
                 # mse_weight,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
             )
@@ -266,9 +270,9 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             #     "avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
             # }
             if cfg.wandb and step % cfg.log_every == 0:
-                wandb.log({**metrics}, step=(epoch * len(dataloader)) + step)
+                wandb.log({**metrics}, step=global_step)
 
-            if (step + 1) % cfg.evaluation.eval_every_steps == 0 or step == 5:
+            if (step + 1) % cfg.evaluation.eval_every_steps == 0 or global_step == 5:
                 splade_model.eval()
                 val_results = validate_model(
                     evaluator,
@@ -292,12 +296,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                                 if k not in ["ndcg@10", "mrr@10", "map@100"]
                             },
                         },
-                        step=(epoch * len(dataloader)) + step,
+                        step=global_step,
                     )
 
                 # Save checkpoint
                 checkpoint_scores = update_checkpoint_tracking(
-                    step=(epoch * len(dataloader)) + step,
+                    step=global_step,
                     score=val_results["ndcg@10"],
                     checkpoint_scores=checkpoint_scores,
                     max_checkpoints=cfg.checkpoint.max_to_keep,
@@ -305,6 +309,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     optimizer=optimizer,
                     checkpoint_path=cfg.checkpoint.checkpoint_path,
                 )
+        global_step += 1
 
 
 @hydra.main(config_path="conf", config_name="modernbert_base", version_base=None)
