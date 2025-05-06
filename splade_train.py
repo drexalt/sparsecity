@@ -309,7 +309,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     optimizer=optimizer,
                     checkpoint_path=cfg.checkpoint.checkpoint_path,
                 )
-        global_step += 1
+            global_step += 1
 
 
 @hydra.main(config_path="conf", config_name="modernbert_base", version_base=None)
