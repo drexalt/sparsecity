@@ -33,8 +33,9 @@ def validate_model(evaluator, model, tokenizer, device, sparse_embed: bool = Fal
 
     # For WandB logging (more detailed)
     supplementary_metrics = {
-        "recall@10": results["NanoBEIR_mean_dot_recall@10"],
-        "precision@1": results["NanoBEIR_mean_dot_precision@1"],
+        "msmarco_mrr@10": results["NanoMSMARCO_dot_mrr@10"],
+        "msmarco_ndcg@10": results["NanoMSMARCO_dot_ndcg@10"],
+        "msmarco_map@100": results["NanoMSMARCO_dot_map@100"],
     }
 
     return {**primary_metrics, **supplementary_metrics}
