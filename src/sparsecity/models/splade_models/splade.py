@@ -11,7 +11,6 @@ class SparseEmbedModel(nn.Module):
         self.projection = nn.Linear(transformer_model.config.hidden_size, embedding_dim)
 
     def forward(self, input_ids, attention_mask, top_k=64):
-        # Step 1: Extract encodings and logits
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -24,25 +23,25 @@ class SparseEmbedModel(nn.Module):
         ]  # [batch_size, seq_len, hidden_size]
 
         activations = torch.log1p(F.relu(logits)) * attention_mask.unsqueeze(-1)
-        sparse_vector = torch.max(activations, dim=1).values  # [batch_size, vocab_size]
+        sparse_vector = torch.amax(activations, dim=1)  # [batch_size, vocab_size]
 
-        top_values, top_indices = torch.topk(
-            sparse_vector, k=top_k, dim=-1
-        )  # [batch_size, top_k]
+        top_values, top_indices = torch.topk(sparse_vector, k=top_k, dim=-1)
+        threshold = top_values[..., -1, None]
+        sparse_vector = sparse_vector * (sparse_vector >= threshold)
 
-        batch_size, seq_len, vocab_size = logits.shape
-        batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, top_k)
-        selected_logits = logits[
-            batch_indices, :, top_indices
-        ]  # [batch_size, seq_len, top_k]
-        attention_weights = F.softmax(
-            selected_logits, dim=1
-        )  # [batch_size, seq_len, top_k]
+        index = top_indices.unsqueeze(1).expand(-1, logits.shape[1], -1)  # [b, seq, k]
+
+        selected_logits = logits.gather(dim=2, index=index)  # [b, seq, k]
+        attention_weights = F.softmax(selected_logits, dim=1)  # [b, seq, k]
+
+        print(f"Shape of sequence_encodings: {sequence_encodings.shape}")
+        assert len(sequence_encodings.shape) == 3, (
+            f"sequence_encodings is not 3D! Shape: {sequence_encodings.shape}"
+        )
 
         contextual_embeddings = torch.bmm(
             attention_weights.transpose(1, 2), sequence_encodings
         )
-        # [batch_size, top_k, hidden_size]
 
         contextual_embeddings = F.relu(self.projection(contextual_embeddings))
         # [batch_size, top_k, embedding_dim]

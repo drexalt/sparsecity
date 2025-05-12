@@ -25,6 +25,7 @@ def gc_backward_and_zero_grad(
     loss: torch.Tensor,
     cached_tensors: Sequence[torch.Tensor],
     recompute_fn: Callable[[slice, RandContext], Sequence[torch.Tensor]],
+    rng_states: list[RandContext],
     model: torch.nn.Module,
     mini_batch_size: int = 32,
 ):
@@ -35,18 +36,23 @@ def gc_backward_and_zero_grad(
     model.zero_grad(set_to_none=True)
 
     B = cached_tensors[0].size(0)
-    rng_states: list[RandContext] = []
-
-    for start in range(0, B, mini_batch_size):
-        sl = slice(start, min(start + mini_batch_size, B))
-        rng_states.append(RandContext(cached_tensors[0][sl]))
+    num_expected_rng_states = (B + mini_batch_size - 1) // mini_batch_size
+    if len(rng_states) != num_expected_rng_states:
+        raise ValueError(
+            f"Mismatch in RNG states. Expected {num_expected_rng_states}, got {len(rng_states)}"
+        )
 
     for i, start in enumerate(range(0, B, mini_batch_size)):
         sl = slice(start, min(start + mini_batch_size, B))
-        with rng_states[i]:
-            replayed = recompute_fn(sl, rng_states[i])
+        current_rng_context_from_pass1 = rng_states[i]
+
+        with current_rng_context_from_pass1:  # Restore RNG state for this mini-batch
+            # The second argument to recompute_fn might be optional if it doesn't need the context object itself
+            replayed_outputs_mb = recompute_fn(sl, current_rng_context_from_pass1)
+
+        current_mb_grads = [g_full[sl] for g_full in grads]
         torch.autograd.backward(
-            replayed,
-            [g[sl] for g in grads],
+            tensors=replayed_outputs_mb,
+            grad_tensors=current_mb_grads,
             retain_graph=False,
         )
