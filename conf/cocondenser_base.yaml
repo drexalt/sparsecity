@@ -10,30 +10,31 @@ data:
 
 use_distillation: True
 custom_kernel: True
-batch_size: 6
-num_negatives: 6
+batch_size: 48
+mini_batch: 4
+num_negatives: 8
 max_length: 256
 lambda_d: 9e-4
 lambda_q: 5e-4
 T_d: 8000
 T_q: 8000
-top_k: 256
+top_k: 128
 epochs: 5
-sparse_embed: True
+sparse_embed: False
 
 optimizer:
   learning_rate: 5e-6
-  warmup_steps: 2000
-  weight_decay: 0.01
+  warmup_steps: 500
+  weight_decay: 0.00
   every_k_schedule: 4
 
 checkpoint:
-  max_to_keep: 5
+  max_to_keep: 3
   save_interval_steps: 800
   checkpoint_path: "checkpoints/cocondenser"
 evaluation:
-  eval_every_steps: 800
-  datasets: ["scifact", "quoraretrieval", "msmarco"]
+  eval_every_steps: 200
+  datasets: ["scifact", "quoraretrieval", "msmarco", "touche2020", "scidocs", "nfcorpus"]
   batch_size: 16
 wandb: True
 wandb_project: "splade-cocondensor"
