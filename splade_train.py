@@ -1,5 +1,6 @@
 # from sparsecity.training.trainer import train_step
-from sparsecity.training.trainer import train_step_kldiv_ibn
+from sparsecity.training.trainer import train_step_kldiv_ibn, train_step_mse
+from datetime import datetime
 
 # from sparsecity.training.sparse_trainer import train_step
 from sparsecity.data.dataset import (
@@ -10,7 +11,7 @@ from sparsecity.models.splade_models.model_registry import get_splade_model
 from sparsecity.evaluation.validate import validate_model
 from sentence_transformers.evaluation import NanoBEIREvaluator
 from sentence_transformers.similarity_functions import dot_score
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BertConfig
 import os
 import torch
 from torch.utils.data import DataLoader
@@ -141,12 +142,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     #     gradient_clipping=trust_region_clip_,
     #     update_clipping=rmsnorm_clip_,
     # )
-    optimizer = heavyball.ForeachSOAP(
+    optimizer = heavyball.ForeachPSGDKron(
         splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         warmup_steps=cfg.optimizer.warmup_steps,
         weight_decay=cfg.optimizer.weight_decay,
         foreach=True,
+        delayed=True,
+        precond_init_scale=1.0,
         gradient_clipping=trust_region_clip_,
         update_clipping=rmsnorm_clip_,
     )
@@ -192,7 +195,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "sparse_embed": cfg.sparse_embed,
             },
         )
-    os.makedirs(cfg.checkpoint.checkpoint_path, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_directory = os.path.join(
+        hydra.utils.to_absolute_path(cfg.checkpoint.checkpoint_path), timestamp
+    )
+    os.makedirs(checkpoint_directory, exist_ok=True)
     checkpoint_scores = []
 
     def optimized_step():
@@ -217,7 +224,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             lambda_t_d = compute_lambda_t(cfg.lambda_d, step_ratio_d)
             lambda_t_q = compute_lambda_t(cfg.lambda_q, step_ratio_q)
             temperature = torch.tensor(5.0, device=device)
-            mse_weight = torch.tensor(0.1, device=device)
+            mse_weight = torch.tensor(1.0, device=device)
             # optimizer.train()
             # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
 
@@ -234,7 +241,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 temperature,
                 neg_mode="batch",
                 mini_batch=cfg.mini_batch,
-                # mse_weight,
+                # mse_weight=mse_weight,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
             )
 
@@ -272,7 +279,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             if cfg.wandb and step % cfg.log_every == 0:
                 wandb.log({**metrics}, step=global_step)
 
-            if (step + 1) % cfg.evaluation.eval_every_steps == 0 or global_step == 5:
+            if (step + 1) % cfg.evaluation.eval_every_steps == 0 or global_step == 50:
                 splade_model.eval()
                 val_results = validate_model(
                     evaluator,
@@ -302,7 +309,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 # Save checkpoint
                 checkpoint_scores = update_checkpoint_tracking(
                     step=global_step,
-                    score=val_results["ndcg@10"],
+                    score=val_results["msmarco_mrr@10"],
                     checkpoint_scores=checkpoint_scores,
                     max_checkpoints=cfg.checkpoint.max_to_keep,
                     splade_model=splade_model,
@@ -315,9 +322,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 @hydra.main(config_path="conf", config_name="modernbert_base", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
+    config = BertConfig.from_pretrained(cfg.model.name)
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model = get_splade_model(
         cfg.model.name,
+        config=config,
         custom_kernel=cfg.custom_kernel,
         sparse_embed=cfg.sparse_embed,
         checkpoint_path=cfg.model.checkpoint_path
