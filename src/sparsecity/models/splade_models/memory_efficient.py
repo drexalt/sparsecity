@@ -80,6 +80,7 @@ def sparse_activation_kernel(
 
 # Define the forward pass as a Triton operation
 @triton_op("custom::sparse_activation", mutates_args={})
+@torch.compiler.disable()
 def sparse_activation(
     logits: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -169,9 +170,7 @@ class MemoryEfficientSplade(nn.Module):
         self.model = transformer_model
 
     def forward(self, input_ids, attention_mask, top_k=64):
-        outputs = self.model(
-            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
-        )
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits
         values = sparse_activation(logits, attention_mask)
 

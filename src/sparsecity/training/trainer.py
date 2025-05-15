@@ -74,29 +74,29 @@ def train_step_mse(
     # anti_zero = torch.log1p(1.0 / (query_sum + 1e-4)) + torch.log1p(
     #     1.0 / (doc_sum + 1e-4)
     # )
-    # teacher_pos = teacher_scores[:, 0]  # Positive teacher score
-    # teacher_neg = teacher_scores[:, 1:]  # Negative teacher scores
-    # student_pos = scores[:, 0]  # Positive student score
-    # student_neg = scores[:, 1:]  # Negative student scores
+    teacher_pos = teacher_scores[:, 0]  # Positive teacher score
+    teacher_neg = teacher_scores[:, 1:]  # Negative teacher scores
+    student_pos = scores[:, 0] / temperature  # Positive student score
+    student_neg = scores[:, 1:] / temperature  # Negative student scores
 
-    # teacher_margins = (
-    #     teacher_pos.unsqueeze(1) - teacher_neg
-    # )  # shape: (batch_size, num_negatives)
-    # student_margins = (
-    #     student_pos.unsqueeze(1) - student_neg
-    # )  # shape: (batch_size, num_negatives)
-    # margin_mse_loss = F.mse_loss(student_margins, teacher_margins)
+    teacher_margins = (
+        teacher_pos.unsqueeze(1) - teacher_neg
+    )  # shape: (batch_size, num_negatives)
+    student_margins = (
+        student_pos.unsqueeze(1) - student_neg
+    )  # shape: (batch_size, num_negatives)
+    margin_mse_loss = F.mse_loss(student_margins, teacher_margins)
 
-    teacher_logits = teacher_scores / temperature
-    student_logits = scores / temperature
+    # teacher_logits = teacher_scores / temperature
+    # student_logits = scores / temperature
 
-    log_p_s = F.log_softmax(student_logits, dim=-1)
-    log_p_t = F.log_softmax(teacher_logits, dim=-1)
+    # log_p_s = F.log_softmax(student_logits, dim=-1)
+    # log_p_t = F.log_softmax(teacher_logits, dim=-1)
 
-    kl_loss = F.kl_div(log_p_s, log_p_t, reduction="batchmean", log_target=True)
+    # kl_loss = F.kl_div(log_p_s, log_p_t, reduction="batchmean", log_target=True)
 
     # Total loss
-    total_loss = triplet_loss + flops + anti_zero + kl_loss
+    total_loss = triplet_loss + flops + anti_zero + margin_mse_loss
 
     # Backward pass
     total_loss.backward()
@@ -106,7 +106,7 @@ def train_step_mse(
 
     metrics["loss"] = total_loss
     metrics["triplet_loss"] = triplet_loss
-    metrics["margin_mse_loss"] = kl_loss
+    metrics["margin_mse_loss"] = margin_mse_loss
     metrics["flops_loss"] = flops
     metrics["anti_zero_loss"] = anti_zero
 
@@ -272,7 +272,7 @@ def train_step_kldiv(
     return metrics
 
 
-# @torch.compile(mode="default")
+# @torch.compile(mode="max-autotune")
 def train_step_kldiv_ibn(
     model: nn.Module,
     query_input_ids: torch.Tensor,

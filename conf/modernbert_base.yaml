@@ -18,6 +18,8 @@ lambda_d: 9e-4
 lambda_q: 5e-4
 T_d: 16000
 T_q: 16000
+T_d_start: 5000
+T_q_start: 5000
 top_k: 128
 epochs: 9
 sparse_embed: False

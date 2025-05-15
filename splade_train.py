@@ -6,6 +6,7 @@ from datetime import datetime
 from sparsecity.data.dataset import (
     MultipleNegativesCollateFn,
     MultipleNegativesDistilCollateFn,
+    KDProcessingCollateFn,
 )
 from sparsecity.models.splade_models.model_registry import get_splade_model
 from sparsecity.evaluation.validate import validate_model
@@ -21,10 +22,11 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig
-import heavyball
+from schedulefree import AdamWScheduleFree
+from pylate.utils import KDProcessing
 
-from heavyball.utils import trust_region_clip_, rmsnorm_clip_
-from heavyball.utils import set_torch
+# from heavyball.utils import trust_region_clip_, rmsnorm_clip_
+# from heavyball.utils import set_torch
 from heapq import heappush, heappop
 
 torch.set_float32_matmul_precision("high")
@@ -46,6 +48,8 @@ class TrainingConfig:
     lambda_q: float
     T_d: float
     T_q: float
+    T_d_start: int
+    T_q_start: int
     top_k: int
     epochs: int
     log_every: int
@@ -112,6 +116,20 @@ def compute_lambda_t(lambda_val: float, step_ratio: float) -> float:
     return min(lambda_val, lambda_val * (step_ratio**2))
 
 
+def compute_lambda_t_delayed(
+    lambda_val: float,
+    global_step: int,
+    start_step: int,
+    end_step: int,  # T_d or T_q
+) -> float:
+    if global_step < start_step:
+        return 0.0
+
+    # progress ∈ (0, 1] during the ramp
+    progress = (global_step - start_step + 1) / (end_step - start_step + 1)
+    return min(lambda_val, lambda_val * (progress**2))
+
+
 def train_model(splade_model, tokenizer, cfg, dataset):
     # Set random seed for reproducibility
     torch.manual_seed(cfg.seed)
@@ -132,33 +150,18 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     # Create optimizer and scheduler
 
-    # optimizer = heavyball.ForeachSFAdamW(
-    #     splade_model.parameters(),
-    #     lr=cfg.optimizer.learning_rate,
-    #     warmup_steps=cfg.optimizer.warmup_steps,
-    #     weight_decay=cfg.optimizer.weight_decay,
-    #     foreach=True,
-    #     caution=True,
-    #     gradient_clipping=trust_region_clip_,
-    #     update_clipping=rmsnorm_clip_,
-    # )
-    optimizer = heavyball.ForeachPSGDKron(
+    optimizer = AdamWScheduleFree(
         splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         warmup_steps=cfg.optimizer.warmup_steps,
         weight_decay=cfg.optimizer.weight_decay,
-        foreach=True,
-        delayed=True,
-        precond_init_scale=1.0,
-        gradient_clipping=trust_region_clip_,
-        update_clipping=rmsnorm_clip_,
     )
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
     if cfg.use_distillation:
         dataloader = DataLoader(
             dataset,
-            collate_fn=MultipleNegativesDistilCollateFn(
+            collate_fn=KDProcessingCollateFn(
                 tokenizer, num_negatives=cfg.num_negatives
             ),
             batch_size=cfg.batch_size,
@@ -218,16 +221,16 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             else:
                 query_ids, query_mask, doc_ids, doc_mask = (t.to(device) for t in batch)
 
-            step_ratio_d = (global_step + 1) / (cfg.T_d + 1)
-            step_ratio_q = (global_step + 1) / (cfg.T_q + 1)
-
-            lambda_t_d = compute_lambda_t(cfg.lambda_d, step_ratio_d)
-            lambda_t_q = compute_lambda_t(cfg.lambda_q, step_ratio_q)
+            lambda_t_d = compute_lambda_t_delayed(
+                cfg.lambda_d, global_step, cfg.T_d_start, cfg.T_d
+            )
+            lambda_t_q = compute_lambda_t_delayed(
+                cfg.lambda_q, global_step, cfg.T_q_start, cfg.T_q
+            )
             temperature = torch.tensor(5.0, device=device)
             mse_weight = torch.tensor(1.0, device=device)
-            # optimizer.train()
+            optimizer.train()
             # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-
             metrics = train_step_kldiv_ibn(
                 splade_model,
                 query_ids,
@@ -264,6 +267,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
 
+            # For SparseEmbed models - will clean eventually when I adapt SparseEmbed for KLDiv
             # metrics = {
             #     "total_loss": metrics["total_loss"].item(),
             #     "triplet_loss": metrics["triplet_loss"].item(),
@@ -281,6 +285,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             if (step + 1) % cfg.evaluation.eval_every_steps == 0 or global_step == 50:
                 splade_model.eval()
+                optimizer.eval()
                 val_results = validate_model(
                     evaluator,
                     splade_model,
@@ -314,7 +319,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     max_checkpoints=cfg.checkpoint.max_to_keep,
                     splade_model=splade_model,
                     optimizer=optimizer,
-                    checkpoint_path=cfg.checkpoint.checkpoint_path,
+                    checkpoint_path=checkpoint_directory,
                 )
             global_step += 1
 
@@ -333,16 +338,38 @@ def main(cfg: DictConfig):
         if cfg.model.checkpoint_path
         else None,
     )
-    dataset = load_dataset(
-        cfg.data.name,
-        split=cfg.data.split,
+    # dataset = load_dataset(
+    #     cfg.data.name,
+    #     split=cfg.data.split,
+    # )
+
+    train_dataset = load_dataset(
+        "lightonai/ms-marco-en-bge-gemma",
+        "train",
+        split="train",
     )
-    set_torch()
+
+    queries = load_dataset(
+        "lightonai/ms-marco-en-bge-gemma",
+        "queries",
+        split="train",
+    )
+
+    documents = load_dataset(
+        "lightonai/ms-marco-en-bge-gemma",
+        "documents",
+        split="train",
+    )
+
+    train_dataset.set_transform(
+        KDProcessing(queries=queries, documents=documents).transform
+    )
+    # set_torch()
     train_model(
         splade_model=model,
         tokenizer=tokenizer,
         cfg=cfg,
-        dataset=dataset,
+        dataset=train_dataset,
     )
 
 

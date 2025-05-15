@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from transformers.utils import ModelOutput
 
 
 class ST_SPLADEModule(nn.Module):
@@ -26,10 +27,31 @@ class ST_SPLADEModule(nn.Module):
         # Set the model to eval mode and get the embeddings.
         self.splade_model.eval()
         with torch.inference_mode():
-            output = self.splade_model(**model_inputs)
+            raw_output = self.splade_model(**model_inputs)
             # In case your model returns a tuple, use the first element.
-            if isinstance(output, (tuple, list)):
-                output = output[0]
+            if isinstance(raw_output, torch.Tensor):  # plain tensor
+                output = raw_output
+
+            elif isinstance(raw_output, (tuple, list)):  # tuple/list → first
+                output = raw_output[0]
+
+            elif isinstance(raw_output, ModelOutput):  # e.g. MaskedLMOutput
+                # SPLADE models place the sparse representation in .logits
+                output = (
+                    raw_output.logits
+                    if hasattr(raw_output, "logits")
+                    else raw_output[0]
+                )
+
+            elif isinstance(raw_output, dict):  # plain dict → first tensor
+                first_key = next(iter(raw_output))
+                output = raw_output[first_key]
+
+            else:
+                raise TypeError(
+                    f"Unsupported model output type: {type(raw_output)}. "
+                    "Expect Tensor / tuple / ModelOutput / dict."
+                )
         # Store the output in the features dict under "sentence_embedding"
         # (Optionally move back to CPU)
         features["sentence_embedding"] = output.cpu()
