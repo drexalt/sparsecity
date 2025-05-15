@@ -23,7 +23,7 @@ from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig
 from schedulefree import AdamWScheduleFree
-from pylate.utils import KDProcessing
+from sparsecity.data.dataset import KDProcessing
 
 # from heavyball.utils import trust_region_clip_, rmsnorm_clip_
 # from heavyball.utils import set_torch
@@ -324,7 +324,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             global_step += 1
 
 
-@hydra.main(config_path="conf", config_name="modernbert_base", version_base=None)
+@hydra.main(config_path="conf", config_name="cocondenser_base", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
     config = BertConfig.from_pretrained(cfg.model.name)
