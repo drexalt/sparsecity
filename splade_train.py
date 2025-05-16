@@ -43,6 +43,7 @@ class TrainingConfig:
     batch_size: int
     mini_batch: int
     num_negatives: int
+    sample_size: int  # Number of negatives to sample from total num_negatives
     max_length: int
     lambda_d: float
     lambda_q: float
@@ -52,6 +53,8 @@ class TrainingConfig:
     T_q_start: int
     top_k: int
     epochs: int
+    init_ce_temp: float
+    init_kl_temp: float
     log_every: int
     optimizer: DictConfig
     checkpoint: DictConfig
@@ -150,9 +153,22 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     # Create optimizer and scheduler
 
+    # Separate learning rate for temperatures
+
+    temp_params = [splade_model.log_t_ce, splade_model.log_t_kl]
+    other_params = [
+        p
+        for n, p in splade_model.named_parameters()
+        if n not in {"log_t_ce", "log_t_kl"}
+    ]
+
+    optim_param_groups = [
+        {"params": temp_params, "lr": cfg.optimizer.learning_rate},
+        {"params": other_params, "lr": cfg.optimizer.learning_rate},
+    ]
+
     optimizer = AdamWScheduleFree(
-        splade_model.parameters(),
-        lr=cfg.optimizer.learning_rate,
+        optim_param_groups,
         warmup_steps=cfg.optimizer.warmup_steps,
         weight_decay=cfg.optimizer.weight_decay,
     )
@@ -162,7 +178,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         dataloader = DataLoader(
             dataset,
             collate_fn=KDProcessingCollateFn(
-                tokenizer, num_negatives=cfg.num_negatives
+                tokenizer, num_negatives=cfg.num_negatives, sample_size=cfg.sample_size
             ),
             batch_size=cfg.batch_size,
             shuffle=True,
@@ -170,6 +186,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             num_workers=4,  # Add multiple workers for better data loading
             persistent_workers=True,  # Keep workers alive between iterations
             prefetch_factor=2,
+            drop_last=True,
         )
     else:
         dataloader = DataLoader(
@@ -183,6 +200,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             num_workers=4,  # Add multiple workers for better data loading
             persistent_workers=True,  # Keep workers alive between iterations
             prefetch_factor=2,
+            drop_last=True,
         )
 
     # Initialize wandb if enabled
@@ -227,7 +245,6 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             lambda_t_q = compute_lambda_t_delayed(
                 cfg.lambda_q, global_step, cfg.T_q_start, cfg.T_q
             )
-            temperature = torch.tensor(5.0, device=device)
             mse_weight = torch.tensor(1.0, device=device)
             optimizer.train()
             # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -241,10 +258,9 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 torch.tensor(lambda_t_d, device=device),
                 torch.tensor(lambda_t_q, device=device),
                 device,
-                temperature,
-                neg_mode="batch",
+                splade_model.temperature_ce,
+                splade_model.temperature_kl,
                 mini_batch=cfg.mini_batch,
-                # mse_weight=mse_weight,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
             )
 
@@ -255,8 +271,6 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "loss/kl_loss": metrics["kl_loss"].item(),
                 "loss/flops": metrics["flops_loss"].item(),
                 "loss/anti_zero": metrics["anti_zero_loss"].item(),
-                "metrics/query_sparsity": metrics["query_sparsity"].item(),
-                "metrics/doc_sparsity": metrics["doc_sparsity"].item(),
                 "metrics/query_min_non_zero": metrics["query_min_non_zero"].item(),
                 "metrics/doc_min_non_zero": metrics["doc_min_non_zero"].item(),
                 "metrics/avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
@@ -266,6 +280,9 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 ].item(),
                 "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
+
+            metrics["metrics/kl_temp"] = splade_model.temperature_kl.detach().item()
+            metrics["metrics/ce_temp"] = splade_model.temperature_ce.detach().item()
 
             # For SparseEmbed models - will clean eventually when I adapt SparseEmbed for KLDiv
             # metrics = {
@@ -337,6 +354,8 @@ def main(cfg: DictConfig):
         checkpoint_path=cfg.model.checkpoint_path
         if cfg.model.checkpoint_path
         else None,
+        init_ce_temp=cfg.init_ce_temp,
+        init_kl_temp=cfg.init_kl_temp,
     )
     # dataset = load_dataset(
     #     cfg.data.name,

@@ -180,3 +180,41 @@ class MemoryEfficientSplade(nn.Module):
         values = values * (values >= threshold)
 
         return values
+
+
+class MemoryEfficientSplade_LearnableTemp(nn.Module):
+    """
+    Memory-efficient SPLADE implementation using Triton kernels.
+    Provides learnable temperature parameters for the CE and KL divergence.
+    """
+
+    def __init__(
+        self,
+        transformer_model: nn.Module,
+        init_ce_temp: float = 5.0,
+        init_kl_temp: float = 5.0,
+    ):
+        super().__init__()
+        self.model = transformer_model
+        self.log_t_ce = nn.Parameter(torch.log(torch.tensor(init_ce_temp)))
+        self.log_t_kl = nn.Parameter(torch.log(torch.tensor(init_kl_temp)))
+
+    @property
+    def temperature_ce(self):
+        return self.log_t_ce.exp()
+
+    @property
+    def temperature_kl(self):
+        return self.log_t_kl.exp()
+
+    def forward(self, input_ids, attention_mask, top_k=64):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        values = sparse_activation(logits, attention_mask)
+
+        # Apply top-k filtering to ensure sparsity
+        top_values, _ = torch.topk(values, k=top_k, dim=-1)
+        threshold = top_values[..., -1, None]
+        values = values * (values >= threshold)
+
+        return values

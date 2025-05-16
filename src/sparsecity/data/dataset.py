@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Tuple
 import ast
 import datasets
 import logging
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -429,16 +430,18 @@ class MultipleNegativesDistilCollateFn:
 
 
 class KDProcessingCollateFn:
-    def __init__(self, tokenizer, num_negatives: int = 32):
+    def __init__(self, tokenizer, num_negatives: int = 32, sample_size: int = 8):
         """
         Initialize the collator with a tokenizer and number of negatives.
         Also modified from PyLate collate function: https://github.com/lightonai/pylate/tree/main/pylate/utils
         Args:
             tokenizer: The tokenizer to use for encoding texts.
             num_negatives (int): Number of negative documents per example.
+            sample_size (int): Number of documents to sample per query.
         """
         self.tokenizer = tokenizer
         self.num_negatives = num_negatives
+        self.sample_size = sample_size
         self.max_length = self.tokenizer.model_max_length
 
     def __call__(
@@ -461,9 +464,9 @@ class KDProcessingCollateFn:
 
         positives = []
         pos_scores = []
-
         negatives = []
         neg_scores = []
+
         for item in batch:
             docs = item["documents"]
             scores = item["scores"]
@@ -476,19 +479,26 @@ class KDProcessingCollateFn:
                 pos_idx = 0
             else:
                 pos_idx = scores.index(max(scores))  # Index of highest score
+
             positive = docs[pos_idx]
             pos_score = scores[pos_idx]
             positives.append(positive)
             pos_scores.append(pos_score)
 
-            # Collect negatives: all documents except the positive, up to num_negatives
+            # Collect negatives: all documents except the positive
             neg_indices = [i for i in range(len(docs)) if i != pos_idx]
-            item_negs = [docs[i] for i in neg_indices][: self.num_negatives]
-            item_neg_scores = [scores[i] for i in neg_indices][: self.num_negatives]
+
+            # Determine the number of negatives to sample
+            sample_size = min(self.sample_size, len(neg_indices))
+
+            # Sample the negatives
+            sampled_indices = random.sample(neg_indices, sample_size)
+            item_negs = [docs[i] for i in sampled_indices]
+            item_neg_scores = [scores[i] for i in sampled_indices]
 
             # Pad negatives if needed
-            if len(item_negs) < self.num_negatives:
-                padding_needed = self.num_negatives - len(item_negs)
+            if len(item_negs) < self.sample_size:
+                padding_needed = self.sample_size - len(item_negs)
                 # Use last negative if available, else positive
                 pad_doc = item_negs[-1] if item_negs else positive
                 pad_score = item_neg_scores[-1] if item_neg_scores else pos_score
@@ -528,7 +538,7 @@ class KDProcessingCollateFn:
         }
 
         neg_doc_encodings = {
-            key: val.reshape(len(batch), self.num_negatives, -1)
+            key: val.reshape(len(batch), self.sample_size, -1)
             for key, val in neg_encodings.items()
         }
 

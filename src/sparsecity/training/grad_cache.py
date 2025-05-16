@@ -33,8 +33,11 @@ def gc_backward_and_zero_grad(
     grads = [t.grad.detach().clone() for t in cached_tensors]
     for t in cached_tensors:
         t.grad = None
-    model.zero_grad(set_to_none=True)
 
+    for n, p in model.named_parameters():
+        if n in ("log_t_ce", "log_t_kl"):
+            continue  # keep their grads
+        p.grad = None
     B = cached_tensors[0].size(0)
     num_expected_rng_states = (B + mini_batch_size - 1) // mini_batch_size
     if len(rng_states) != num_expected_rng_states:

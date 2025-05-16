@@ -1,7 +1,8 @@
 from transformers import AutoModelForMaskedLM, AutoConfig
-from .splade import SpladeModel, SparseEmbedModel
-from .memory_efficient import MemoryEfficientSplade
+from .splade import SpladeModel, SparseEmbedModel, SpladeModel_LearnableTemp
+from .memory_efficient import MemoryEfficientSplade, MemoryEfficientSplade_LearnableTemp
 import torch
+from typing import Optional
 
 
 def get_splade_model(
@@ -11,6 +12,8 @@ def get_splade_model(
     sparse_embed: bool = False,
     custom_kernel: bool = False,
     checkpoint_path: str = None,
+    init_ce_temp: Optional[float] = 1.0,
+    init_kl_temp: Optional[float] = 5.0,
 ) -> SpladeModel:
     """
     Get a SPLADE model based on a pretrained transformer model.
@@ -19,6 +22,10 @@ def get_splade_model(
         model_name: Name of the pretrained model (e.g., "bert-base-uncased", "distilbert-base-uncased")
         device: Device to load the model on ("cuda" or "cpu")
         custom_kernel: Custom activation kernel
+        sparse_embed: Use contextual embeddings from SparseEmbed paper (not compatible with kl)
+        checkpoint_path: Path to a checkpoint to load the model from
+        init_ce_temp: Initial temperature for the CE loss
+        init_kl_temp: Initial temperature for the KL loss
     Returns:
         SpladeModel instance
     """
@@ -48,7 +55,17 @@ def get_splade_model(
     if sparse_embed:
         splade_model = SparseEmbedModel(transformer_model).to(device)
     elif custom_kernel:
-        splade_model = MemoryEfficientSplade(transformer_model).to(device)
+        if init_kl_temp is None:
+            splade_model = MemoryEfficientSplade(transformer_model).to(device)
+        else:
+            splade_model = MemoryEfficientSplade_LearnableTemp(
+                transformer_model, init_ce_temp, init_kl_temp
+            ).to(device)
     else:
-        splade_model = SpladeModel(transformer_model).to(device)
+        if init_kl_temp is None:
+            splade_model = SpladeModel(transformer_model).to(device)
+        else:
+            splade_model = SpladeModel_LearnableTemp(
+                transformer_model, init_ce_temp, init_kl_temp
+            ).to(device)
     return splade_model

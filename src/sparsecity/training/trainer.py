@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from jaxtyping import Float, Int
 import torch
 import torch.nn as nn
@@ -272,242 +272,36 @@ def train_step_kldiv(
     return metrics
 
 
-# @torch.compile(mode="max-autotune")
-def train_step_kldiv_ibn(
+# @torch.compile(mode="max-autotune") # Kept commented as in source _vectorized version
+def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
     model: nn.Module,
-    query_input_ids: torch.Tensor,
-    query_attention_mask: torch.Tensor,
-    doc_input_ids: torch.Tensor,
-    doc_attention_mask: torch.Tensor,
+    query_input_ids: torch.Tensor,  # Shape: [B, Lq]
+    query_attention_mask: torch.Tensor,  # Shape: [B, Lq]
+    doc_input_ids: torch.Tensor,  # Shape: [B, n_docs_per_query, Ld]
+    doc_attention_mask: torch.Tensor,  # Shape: [B, n_docs_per_query, Ld]
     top_k: int,
     lambda_t_d: torch.Tensor,
     lambda_t_q: torch.Tensor,
     device: torch.device,
-    temperature: torch.Tensor,
-    neg_mode: str = "batch",
-    mini_batch: int = 16,
-    teacher_scores: Optional[torch.Tensor] = None,
+    temperature_ce: torch.Tensor,  # Temperature for CrossEntropy loss
+    temperature_kl: torch.Tensor,  # Temperature for KL divergence loss
+    mini_batch: int,  # Mini-batch size for GradCache
+    teacher_scores: Optional[
+        torch.Tensor
+    ] = None,  # Shape: [B, n_docs_per_query], aligns with doc_input_ids
 ) -> Dict[str, torch.Tensor]:
-    torch.compiler.cudagraph_mark_step_begin()
-    model.train()
-    # optimizer.zero_grad()
-    B, n, Ld = doc_input_ids.shape
-    V = None  # (will know after fwd)
-    world = (
-        torch.distributed.get_world_size()
-        if (neg_mode == "global" and torch.distributed.is_initialized())
-        else 1
-    )
-    rank = torch.distributed.get_rank() if world > 1 else 0
-
-    # ---------- pass-1: embed without graph --------------------------
-    q_emb_chunks, d_emb_chunks = [], []
-    pass_1_rng_states: List[RandContext] = []  # Stores RNG states from pass-1
-
-    for start in range(0, B, mini_batch):
-        sl = slice(start, min(start + mini_batch, B))
-
-        ids_q = query_input_ids[sl]
-        mask_q = query_attention_mask[sl]
-
-        ids_d = doc_input_ids[sl].reshape(-1, Ld)
-        mask_d = doc_attention_mask[sl].reshape(-1, Ld)
-
-        ids_comb = torch.cat([ids_q, ids_d], dim=0)
-        mask_comb = torch.cat([mask_q, mask_d], dim=0)
-
-        rng_ctx_for_mb = RandContext(ids_comb)  # Or any tensor on the correct device(s)
-        pass_1_rng_states.append(rng_ctx_for_mb)
-
-        with torch.no_grad(), rng_ctx_for_mb:
-            emb = model(
-                input_ids=ids_comb, attention_mask=mask_comb, top_k=top_k
-            )  # [(mb + mb·n), V]
-            V = emb.size(-1)
-
-        q_emb = emb[: len(ids_q)]  # [mb, V]
-        d_emb = emb[len(ids_q) :].reshape(len(ids_q), n, V)  # [mb, n, V]
-
-        q_emb_chunks.append(q_emb.detach().requires_grad_())
-        d_emb_chunks.append(d_emb.detach().requires_grad_())
-
-    q_emb = torch.cat(q_emb_chunks, 0).detach().requires_grad_()  # [B, V]
-    d_emb = torch.cat(d_emb_chunks, 0).detach().requires_grad_()  # [B, n, V]
-
-    # ---------- build scores matrix & loss --------------------------
-    if neg_mode == "row":
-        # We want           [pos | row-hard-negs | batch-negs]
-        # shape per query :  1   +   (n-1)        +  (B-1)*n
-        # ----------------------------------------------------------------
-        d_flat = d_emb.reshape(B * n, V)  # [(B·n), V]
-        scores_full = torch.matmul(q_emb, d_flat.T)  # [B, B·n]
-
-        # build a (B, B·n) index tensor that selects the columns
-        # in the order:   pos  →  hard-negs  →  other-rows
-        keep_cols = []
-        all_cols = torch.arange(B * n, device=device)
-        for i in range(B):
-            row_cols = all_cols[i * n : (i + 1) * n]  # this query’s row
-            pos_col = row_cols[:1]  # first is positive
-            hard_negs = row_cols[1:]  # rest in the same row
-            batch_negs = all_cols[(all_cols // n) != i]  # every other row
-            keep_cols.append(torch.cat([pos_col, hard_negs, batch_negs], dim=0))
-        keep_cols = torch.stack(keep_cols, 0)  # [B, B·n]
-
-        # fancy-index the full score table
-        scores = torch.gather(scores_full, 1, keep_cols)  # [B, 1+(n-1)+(B-1)·n]
-        labels = torch.zeros(B, dtype=torch.long, device=device)
-    else:
-        d_flat = d_emb.reshape(B * n, V)
-
-        if neg_mode == "global" and world > 1:
-            gathered = [torch.zeros_like(d_flat) for _ in range(world)]
-            torch.distributed.all_gather(gathered, d_flat)
-            d_flat = torch.cat(gathered, 0)  # [B*n*W, V]
-
-        # dot-product against the big doc table
-        scores_full = torch.matmul(q_emb, d_flat.T)  # [B, D*]
-
-        if neg_mode == "batch":
-            # keep 1 positive  +  all docs from *other* rows
-            keep_cols = []
-            for i in range(B):
-                # col idx of pos for query i in local d_flat
-                pos = i * n + (rank * B * n if neg_mode == "global" else 0)
-                others = torch.arange(0, B * n * world, device=device)
-                mask = (others // n) != i  # drop own row
-                keep = torch.cat([others[pos : pos + 1], others[mask]])
-                keep_cols.append(keep)
-            scores = torch.stack([scores_full[i, keep_cols[i]] for i in range(B)])
-            labels = torch.zeros(B, dtype=torch.long, device=device)
-
-        else:  # neg_mode == "global"  (= full table)
-            labels = torch.arange(B, device=device) + rank * B
-            scores = scores_full
-
-    scores = scores / temperature
-
-    # ------------------ primary CE loss ----------------------------
-    triplet_loss = F.cross_entropy(scores, labels)
-
-    # ------------------ regularisers -------------------------------
-    doc_vecs = d_emb.reshape(-1, d_emb.size(-1))  # [(B·n), V]
-    doc_flops = torch.sum(doc_vecs.abs(), dim=-1).mean()  # scalar
-    query_l1 = torch.sum(q_emb.abs(), dim=-1).mean()  # scalar
-    flops = lambda_t_d * doc_flops + lambda_t_q * query_l1
-
-    anti_zero = torch.clamp(
-        torch.reciprocal(q_emb.sum() ** 2 + 1e-8)
-        + torch.reciprocal(d_emb.sum() ** 2 + 1e-8),
-        max=1.0,
-    )
-
-    kl_loss = torch.tensor(0.0, device=device)
-    if teacher_scores is not None:
-        t_logits = teacher_scores / temperature
-        student_row_logits = torch.einsum("bd,bnd->bn", q_emb, d_emb)
-        student_row_logits = student_row_logits / temperature
-        kl_loss = F.kl_div(
-            F.log_softmax(student_row_logits, dim=-1),
-            F.log_softmax(t_logits, dim=-1),
-            reduction="batchmean",
-            log_target=True,
-        )
-
-    total_loss = triplet_loss + flops + anti_zero + kl_loss
-
-    def _recompute(sl: slice, _rng_ctx: RandContext):
-        # identical forward as in pass-1 but with grad enabled
-        ids_q = query_input_ids[sl]
-        mask_q = query_attention_mask[sl]
-        ids_d = doc_input_ids[sl].reshape(-1, Ld)
-        mask_d = doc_attention_mask[sl].reshape(-1, Ld)
-        ids_comb = torch.cat([ids_q, ids_d], 0)
-        mask_comb = torch.cat([mask_q, mask_d], 0)
-
-        emb = model(
-            input_ids=ids_comb, attention_mask=mask_comb, top_k=top_k
-        )  # grad on
-        q = emb[: len(ids_q)]
-        d = emb[len(ids_q) :].reshape(len(ids_q), n, V)
-        return [q, d]
-
-    gc_backward_and_zero_grad(
-        total_loss, [q_emb, d_emb], _recompute, pass_1_rng_states, model, mini_batch
-    )
-
-    # ------------------ metrics dict -------------------------------
-
-    metrics = {}
-    query_non_zero_vals = q_emb[q_emb != 0]
-    doc_non_zero_vals = d_emb[d_emb != 0]
-
-    metrics["query_min_non_zero"] = (
-        query_non_zero_vals.abs().min()
-        if query_non_zero_vals.numel() > 0
-        else torch.tensor(0.0, device=device)
-    )
-    metrics["doc_min_non_zero"] = (
-        doc_non_zero_vals.abs().min()
-        if doc_non_zero_vals.numel() > 0
-        else torch.tensor(0.0, device=device)
-    )
-    metrics["query_median_non_zero"] = (
-        torch.median(query_non_zero_vals.abs())
-        if query_non_zero_vals.numel() > 0
-        else torch.tensor(0.0, device=device)
-    )
-    metrics["doc_median_non_zero"] = (
-        torch.median(doc_non_zero_vals.abs())
-        if doc_non_zero_vals.numel() > 0
-        else torch.tensor(0.0, device=device)
-    )
-
-    metrics["avg_query_non_zero_count"] = query_non_zero_vals.numel() / B
-    metrics["avg_doc_non_zero_count"] = doc_non_zero_vals.numel() / (B * n)
-
-    metrics = {
-        "loss": total_loss,
-        "triplet_loss": triplet_loss,
-        "kl_loss": kl_loss,
-        "flops_loss": flops,
-        "anti_zero_loss": anti_zero,
-        "query_sparsity": (q_emb == 0).float().mean(),
-        "doc_sparsity": (d_emb == 0).float().mean(),
-        **metrics,
-    }
-    return metrics
-
-
-def train_step_kldiv_ibn_vectorized(
-    model: nn.Module,
-    query_input_ids: torch.Tensor,  # [B, Lq]
-    query_attention_mask: torch.Tensor,  # [B, Lq]
-    doc_input_ids: torch.Tensor,  # [B, n, Ld] (n = 1 pos + num_hard_neg from collate)
-    doc_attention_mask: torch.Tensor,  # [B, n, Ld]
-    top_k: int,
-    lambda_t_d: torch.Tensor,
-    lambda_t_q: torch.Tensor,
-    device: torch.device,
-    temperature_ce: torch.Tensor,
-    temperature_kl: torch.Tensor,  # Added separate temperature for KL
-    neg_mode: str = "batch",
-    mini_batch: int = 16,
-    teacher_scores: Optional[torch.Tensor] = None,  # [B, n], aligns with doc_input_ids
-) -> Dict[str, torch.Tensor]:
-    # if torch.cuda.is_available(): torch.compiler.cudagraph_mark_step_begin() # For torch.compile with CUDA graphs
+    # if torch.cuda.is_available(): torch.compiler.cudagraph_mark_step_begin()
     model.train()
 
-    B, n_docs_per_query, Ld = (
-        doc_input_ids.shape
-    )  # n_docs_per_query is `n` from previous code
-    V: Optional[int] = (
-        None  # Vocabulary size, will be known after first model forward pass
-    )
+    B, n_docs_per_query, Ld = doc_input_ids.shape
+    embedding_dim: Optional[int] = None  # Will be inferred after the first model pass
 
-    # ---------- pass-1: embed without graph (for memory saving) --------------------------
+    # --- Pass 1: Embeddings with no_grad (for GradCache) ---
+    # This pass computes query and document embeddings in mini-batches without storing
+    # the computation graph for activations, saving memory. RNG states are saved
+    # to ensure consistency (e.g., for dropout) during the recomputation pass.
     q_emb_chunks, d_emb_chunks = [], []
-    pass_1_rng_states = []  # If your RandContext needs to save states from pass-1
+    pass_1_rng_states: List[RandContext] = []
 
     for start_idx in range(0, B, mini_batch):
         sl = slice(start_idx, min(start_idx + mini_batch, B))
@@ -515,7 +309,6 @@ def train_step_kldiv_ibn_vectorized(
 
         ids_q_mb = query_input_ids[sl]
         mask_q_mb = query_attention_mask[sl]
-
         ids_d_mb = doc_input_ids[sl].reshape(
             current_mini_batch_size * n_docs_per_query, Ld
         )
@@ -526,149 +319,120 @@ def train_step_kldiv_ibn_vectorized(
         ids_comb_mb = torch.cat([ids_q_mb, ids_d_mb], dim=0)
         mask_comb_mb = torch.cat([mask_q_mb, mask_d_mb], dim=0)
 
-        rng_context_for_this_mb = RandContext(
+        # RandContext captures and restores RNG state for operations like dropout
+        # ensuring consistency between this no_grad pass and the later recomputation pass.
+        rng_ctx_for_mb = RandContext(
             ids_comb_mb
-        )  # Or any tensor on the correct device(s)
-        pass_1_rng_states.append(rng_context_for_this_mb)
+        )  # Needs a tensor on the correct device
+        pass_1_rng_states.append(rng_ctx_for_mb)
 
-        with (
-            torch.no_grad(),
-            rng_context_for_this_mb,
-        ):  # Manage RNG for dropout consistency if needed
+        with torch.no_grad(), rng_ctx_for_mb:
             emb_mb = model(
                 input_ids=ids_comb_mb, attention_mask=mask_comb_mb, top_k=top_k
             )
-            if V is None:
-                V = emb_mb.size(-1)
+            if embedding_dim is None:
+                embedding_dim = emb_mb.size(-1)
 
         q_emb_mb = emb_mb[:current_mini_batch_size]
         d_emb_mb = emb_mb[current_mini_batch_size:].reshape(
-            current_mini_batch_size, n_docs_per_query, V
+            current_mini_batch_size, n_docs_per_query, embedding_dim
         )
 
-        q_emb_chunks.append(q_emb_mb)  # Already detached due to torch.no_grad()
+        q_emb_chunks.append(q_emb_mb)  # Detached due to torch.no_grad()
         d_emb_chunks.append(d_emb_mb)
 
-    q_emb = torch.cat(q_emb_chunks, 0).requires_grad_()  # [B, V]
-    d_emb = torch.cat(d_emb_chunks, 0).requires_grad_()  # [B, n_docs_per_query, V]
+    # Concatenate chunks and enable gradient tracking for these intermediate embeddings
+    q_emb = torch.cat(q_emb_chunks, 0).requires_grad_()  # Shape: [B, embedding_dim]
+    d_emb = torch.cat(
+        d_emb_chunks, 0
+    ).requires_grad_()  # Shape: [B, n_docs, embedding_dim]
 
-    # ---------- build scores matrix & loss (vectorized negative sampling) --------------------------
-    # d_flat contains all B * n_docs_per_query document embeddings sequentially
-    d_flat = d_emb.reshape(B * n_docs_per_query, V)  # [B * n_docs_per_query, V]
+    # --- Score Calculation (In-Batch Negatives) ---
+    # For each query q_i, the positive is d_emb[i,0,:] (the first document associated with q_i).
+    # Negatives are all documents from *other* queries in the batch, i.e., d_emb[j,k,:] for all j != i and all k.
 
-    # scores_full[i, j] = score(q_emb[i], d_flat[j])
-    scores_full = torch.matmul(q_emb, d_flat.T)  # [B, B * n_docs_per_query]
+    # Flatten all document embeddings: [B * n_docs_per_query, embedding_dim]
+    d_all_docs_flat = d_emb.reshape(B * n_docs_per_query, embedding_dim)
 
-    if neg_mode == "row":
-        # For query i: scores are [pos_i | hard_negs_i | batch_negs_i (all docs from other queries)]
-        # Positive is always the first item for the CrossEntropyLoss.
-        labels = torch.zeros(B, dtype=torch.long, device=device)
+    # Full score matrix: query_i vs all_doc_j
+    # scores_q_vs_all_docs[i,j] = score(q_emb[i], d_all_docs_flat[j])
+    scores_q_vs_all_docs = torch.matmul(
+        q_emb, d_all_docs_flat.T
+    )  # Shape: [B, B * n_docs_per_query]
 
-        # Indices of positive documents for each query within d_flat
-        # The positive for query `i` is `d_emb[i,0,:]`, which is at `d_flat[i * n_docs_per_query, :]`
-        pos_col_indices_in_d_flat = torch.arange(
-            start=0, end=B * n_docs_per_query, step=n_docs_per_query, device=device
-        )
-        pos_item_cols = pos_col_indices_in_d_flat.unsqueeze(1)  # [B, 1]
+    # Labels for CrossEntropyLoss: positive is always at index 0 after gathering
+    labels = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Hard negative columns for each query (from d_emb[i, 1:, :])
-        if n_docs_per_query > 1:  # If there are any hard negatives
-            hard_neg_offsets = torch.arange(
-                1, n_docs_per_query, device=device
-            ).unsqueeze(0)  # [1, n_docs_per_query-1]
-            # Broadcasting: [B,1] (pos_item_cols) + [1, n_docs_per_query-1] (offsets)
-            hard_neg_item_cols = (
-                pos_item_cols + hard_neg_offsets
-            )  # [B, n_docs_per_query-1]
-        else:  # No hard negatives if n_docs_per_query=1 (only positive)
-            hard_neg_item_cols = torch.empty((B, 0), dtype=torch.long, device=device)
+    # Indices of positive documents for each query in d_all_docs_flat
+    # Positive for query `i` is `d_emb[i,0,:]`, located at `d_all_docs_flat[i * n_docs_per_query, :]`
+    pos_doc_indices_flat = torch.arange(
+        start=0, end=B * n_docs_per_query, step=n_docs_per_query, device=device
+    )
+    pos_item_cols = pos_doc_indices_flat.unsqueeze(1)  # Shape: [B, 1]
 
-        if B == 1:  # Only one query, no batch negatives from "other" queries
-            batch_neg_item_cols = torch.empty((B, 0), dtype=torch.long, device=device)
-        else:
-            # Batch negative columns: all (B-1)*n_docs_per_query documents from other queries
-            all_doc_indices_global = torch.arange(
-                B * n_docs_per_query, device=device
-            )  # [B*n_docs_per_query]
-            # doc_query_owner[k] = query_idx (0 to B-1) that document k belongs to
-            doc_query_owner = all_doc_indices_global // n_docs_per_query
+    # Indices of batch negative documents
+    # Identify owner query for each doc in d_all_docs_flat
+    doc_query_owner_idx = (
+        torch.arange(B * n_docs_per_query, device=device) // n_docs_per_query
+    )  # Shape: [B*n_docs_per_query]
 
-            current_query_idx_expanded = torch.arange(B, device=device).unsqueeze(
-                1
-            )  # [B, 1]
-            # batch_neg_mask[i,j] is True if doc j is a batch_neg for query i (i.e., doc_query_owner[j] != i)
-            batch_neg_mask = (
-                doc_query_owner.unsqueeze(0) != current_query_idx_expanded
-            )  # [B, B*n_docs_per_query]
+    # Expand current query indices for broadcasting: [B, 1]
+    current_query_indices_expanded = torch.arange(B, device=device).unsqueeze(1)
 
-            replicated_all_doc_indices = all_doc_indices_global.unsqueeze(0).expand(
-                B, -1
-            )  # [B, B*n_docs_per_query]
-            # Select based on mask and reshape to [B, num_batch_negs]
-            num_batch_negs = (B - 1) * n_docs_per_query
-            batch_neg_item_cols = replicated_all_doc_indices[batch_neg_mask].reshape(
-                B, num_batch_negs
-            )
+    # Mask: is_batch_negative_mask[i,j] is True if d_all_docs_flat[j] is a negative for query_i
+    # This means doc_query_owner_idx[j] should not be equal to i.
+    is_batch_negative_mask = (
+        doc_query_owner_idx.unsqueeze(0) != current_query_indices_expanded
+    )  # Shape: [B, B*n_docs_per_query]
 
-        keep_cols = torch.cat(
-            [pos_item_cols, hard_neg_item_cols, batch_neg_item_cols], dim=1
-        )
-        # Shape: [B, 1 + (n_docs_per_query-1) + (B-1)*n_docs_per_query] = [B, B * n_docs_per_query]
-        scores = torch.gather(scores_full, 1, keep_cols)
+    # Get indices of all documents, replicated for each query row
+    all_doc_indices_replicated = (
+        torch.arange(B * n_docs_per_query, device=device).unsqueeze(0).expand(B, -1)
+    )
 
-    elif neg_mode == "batch":
-        # For query i: scores are [pos_i | batch_negs_i (all n_docs_per_query docs from each of (B-1) other queries)]
-        labels = torch.zeros(B, dtype=torch.long, device=device)
+    num_batch_negs_per_query = (B - 1) * n_docs_per_query
+    batch_neg_item_cols = all_doc_indices_replicated[is_batch_negative_mask].reshape(
+        B, num_batch_negs_per_query
+    )
 
-        pos_col_indices_in_d_flat = torch.arange(
-            start=0, end=B * n_docs_per_query, step=n_docs_per_query, device=device
-        )
-        pos_item_cols = pos_col_indices_in_d_flat.unsqueeze(1)  # [B, 1]
+    # Combine positive and negative indices for gathering
+    # Final scores tensor will have shape: [B, 1 (positive) + (B-1)*n_docs_per_query (batch negatives)]
+    final_score_indices = torch.cat([pos_item_cols, batch_neg_item_cols], dim=1)
 
-        if B == 1:  # Only one query, no "other" queries for batch negatives
-            batch_neg_item_cols = torch.empty((B, 0), dtype=torch.long, device=device)
-        else:
-            # Batch negative columns logic is identical to that in "row" mode
-            all_doc_indices_global = torch.arange(B * n_docs_per_query, device=device)
-            doc_query_owner = all_doc_indices_global // n_docs_per_query
-            current_query_idx_expanded = torch.arange(B, device=device).unsqueeze(1)
-            batch_neg_mask = doc_query_owner.unsqueeze(0) != current_query_idx_expanded
-            replicated_all_doc_indices = all_doc_indices_global.unsqueeze(0).expand(
-                B, -1
-            )
-            num_batch_negs = (B - 1) * n_docs_per_query
-            batch_neg_item_cols = replicated_all_doc_indices[batch_neg_mask].reshape(
-                B, num_batch_negs
-            )
+    # Gather the scores based on the constructed indices
+    scores_for_ce = torch.gather(scores_q_vs_all_docs, 1, final_score_indices)
+    scores_for_ce = scores_for_ce / temperature_ce
 
-        keep_cols = torch.cat([pos_item_cols, batch_neg_item_cols], dim=1)
-        # Shape: [B, 1 + (B-1)*n_docs_per_query]
-        scores = torch.gather(scores_full, 1, keep_cols)
+    # --- Loss Computations ---
+    # 1. Triplet Loss (CrossEntropy with in-batch negatives)
+    triplet_loss = F.cross_entropy(scores_for_ce, labels)
 
-    scores = scores / temperature_ce
+    # 2. FLOPs Regularization (L1 norm on embeddings)
+    doc_l1_sum_abs_mean = torch.sum(
+        d_all_docs_flat.abs(), dim=-1
+    ).mean()  # L1 norm per doc, then mean
+    query_l1_sum_abs_mean = torch.sum(
+        q_emb.abs(), dim=-1
+    ).mean()  # L1 norm per query, then mean
+    flops_loss = lambda_t_d * doc_l1_sum_abs_mean + lambda_t_q * query_l1_sum_abs_mean
 
-    # ------------------ primary CE loss ----------------------------
-    triplet_loss = F.cross_entropy(scores, labels)
+    # 3. Anti-Zero Loss
+    q_total_sum_sq_inv = torch.reciprocal(
+        q_emb.sum().pow(2) + 1e-8
+    )  # Sum over all elements
+    d_total_sum_sq_inv = torch.reciprocal(
+        d_emb.sum().pow(2) + 1e-8
+    )  # Sum over all elements
+    anti_zero_loss = torch.clamp(q_total_sum_sq_inv + d_total_sum_sq_inv, max=1.0)
 
-    doc_vecs = d_emb.reshape(-1, d_emb.size(-1))  # [(B·n), V]
-    doc_flops = torch.sum(doc_vecs.abs(), dim=-1).mean()  # scalar
-    query_l1 = torch.sum(q_emb.abs(), dim=-1).mean()  # scalar
-    flops_loss = lambda_t_d * doc_flops + lambda_t_q * query_l1
-
-    # ------------------ Anti-zero loss (optional) -------------------
-    # Sums over all elements in all query/document embeddings respectively
-    q_sum_sq_inv = torch.reciprocal(q_emb.sum().pow(2) + 1e-8)
-    d_sum_sq_inv = torch.reciprocal(d_emb.sum().pow(2) + 1e-8)
-    anti_zero = torch.clamp(q_sum_sq_inv + d_sum_sq_inv, max=1.0)
-
-    # ------------------ KL divergence distillation loss -------------
+    # 4. KL Divergence Distillation Loss
     kl_loss = torch.tensor(0.0, device=device)
     if teacher_scores is not None:
-        # teacher_scores has shape [B, n_docs_per_query], aligning with d_emb[b, :, :]
-        # Student scores for q_i vs its own n_docs_per_query documents:
+        # teacher_scores shape: [B, n_docs_per_query]
+        # Student scores for q_i vs its *own* n_docs_per_query documents: d_emb[i, :, :]
         student_row_logits = torch.einsum(
             "bv,bnv->bn", q_emb, d_emb
-        )  # [B, n_docs_per_query]
+        )  # Shape: [B, n_docs_per_query]
 
         teacher_log_softmax = F.log_softmax(teacher_scores / temperature_kl, dim=-1)
         student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
@@ -680,17 +444,28 @@ def train_step_kldiv_ibn_vectorized(
             log_target=True,
         )
 
-    total_loss = triplet_loss + flops_loss + kl_loss + anti_zero
+    total_loss = triplet_loss + flops_loss + kl_loss + anti_zero_loss
 
-    # ---------- Backward pass using gradient checkpointing strategy --------------------
-    def _recompute(sl_mb: slice, _rng_ctx_dummy: RandContext):
+    # --- Backward Pass using GradCache ---
+    # The _recompute function is called by gc_backward_and_zero_grad for each mini-batch.
+    # It re-runs the model for that mini-batch, this time with autograd enabled,
+    # to reconstruct the activations needed for gradient calculation.
+    # The `rng_ctx_for_mb_recompute` ensures that dropout (and other RNG-based ops)
+    # behave identically to the first pass.
+    def _recompute_for_gradcache(
+        sl_mb: slice,
+        rng_ctx_for_mb_recompute: RandContext,  # Provided by gc_backward_and_zero_grad from pass_1_rng_states
+    ):
         current_mini_batch_size_recompute = sl_mb.stop - sl_mb.start
 
+        # Prepare inputs for the current mini-batch slice
         ids_q_recompute = query_input_ids[sl_mb]
         mask_q_recompute = query_attention_mask[sl_mb]
-        # Ensure V is defined from pass-1; it should be.
-        if V is None:
-            raise ValueError("V (vocab_size/embedding_dim) not set from pass-1.")
+
+        if embedding_dim is None:  # Should be set from pass-1
+            raise ValueError(
+                "Embedding dimension (embedding_dim) not set from pass-1 during recomputation."
+            )
 
         ids_d_recompute = doc_input_ids[sl_mb].reshape(
             current_mini_batch_size_recompute * n_docs_per_query, Ld
@@ -702,35 +477,57 @@ def train_step_kldiv_ibn_vectorized(
         ids_comb_recompute = torch.cat([ids_q_recompute, ids_d_recompute], dim=0)
         mask_comb_recompute = torch.cat([mask_q_recompute, mask_d_recompute], dim=0)
 
-        with _rng_ctx_dummy:  # If RandContext is used for RNG restoration
-            emb_recompute = model(
-                input_ids=ids_comb_recompute,
-                attention_mask=mask_comb_recompute,
-                top_k=top_k,
-            )
+        # Re-execute model forward pass for this mini-batch with gradient tracking enabled.
+        # The provided rng_ctx_for_mb_recompute ensures consistent RNG.
+        emb_recompute = model(
+            input_ids=ids_comb_recompute,
+            attention_mask=mask_comb_recompute,
+            top_k=top_k,
+        )
 
         q_recomputed = emb_recompute[:current_mini_batch_size_recompute]
         d_recomputed = emb_recompute[current_mini_batch_size_recompute:].reshape(
-            current_mini_batch_size_recompute, n_docs_per_query, V
+            current_mini_batch_size_recompute, n_docs_per_query, embedding_dim
         )
-        return [q_recomputed, d_recomputed]
+        return [
+            q_recomputed,
+            d_recomputed,
+        ]  # Must return in same order as tensors in second argument to gc_backward_and_zero_grad
 
+    # gc_backward_and_zero_grad handles the chunked backward pass.
+    # It recomputes activations for each chunk via _recompute_for_gradcache,
+    # then backpropagates gradients for that chunk, and finally zeros model gradients.
     gc_backward_and_zero_grad(
-        total_loss, [q_emb, d_emb], pass_1_rng_states, _recompute, model, mini_batch
+        loss=total_loss,
+        cached_tensors=[
+            q_emb,
+            d_emb,
+        ],  # Tensors from pass-1 for which grads are needed
+        rng_states=pass_1_rng_states,  # List of RNG contexts from pass-1
+        recompute_fn=_recompute_for_gradcache,
+        model=model,
+        mini_batch_size=mini_batch,
     )
 
-    # ------------------ metrics dict -------------------------------
+    # --- Metrics ---
     metrics_dict: Dict[str, torch.Tensor] = {}
     with torch.no_grad():  # Metrics calculation should not contribute to graph
+        metrics_dict["loss"] = total_loss.detach()
+        metrics_dict["triplet_loss"] = triplet_loss.detach()
+        metrics_dict["kl_loss"] = kl_loss.detach()
+        metrics_dict["flops_loss"] = flops_loss.detach()
+        metrics_dict["anti_zero_loss"] = anti_zero_loss.detach()
+
         q_abs = q_emb.abs()
         d_abs = d_emb.abs()
-
-        # Using a small threshold for "non-zero" for robustness with float precision
         is_q_nonzero = q_abs > 1e-9
         is_d_nonzero = d_abs > 1e-9
 
         q_nonzero_vals = q_abs[is_q_nonzero]
         d_nonzero_vals = d_abs[is_d_nonzero]
+
+        metrics_dict["query_sparsity"] = (~is_q_nonzero).float().mean()
+        metrics_dict["doc_sparsity"] = (~is_d_nonzero).float().mean()
 
         metrics_dict["query_min_non_zero"] = (
             q_nonzero_vals.min()
@@ -742,7 +539,6 @@ def train_step_kldiv_ibn_vectorized(
             if d_nonzero_vals.numel() > 0
             else torch.tensor(0.0, device=device)
         )
-
         metrics_dict["query_median_non_zero"] = (
             torch.median(q_nonzero_vals)
             if q_nonzero_vals.numel() > 0
@@ -755,23 +551,13 @@ def train_step_kldiv_ibn_vectorized(
         )
 
         metrics_dict["avg_query_non_zero_count"] = (
-            is_q_nonzero.sum() / B
-        )  # Sum of True values
-        metrics_dict["avg_doc_non_zero_count"] = is_d_nonzero.sum() / (
-            B * n_docs_per_query
+            is_q_nonzero.sum() / B if B > 0 else torch.tensor(0.0, device=device)
         )
-
-        metrics_dict["query_sparsity"] = (
-            (~is_q_nonzero).float().mean()
-        )  # Proportion of zero/near-zero values
-        metrics_dict["doc_sparsity"] = (~is_d_nonzero).float().mean()
-
-        metrics_dict["loss"] = total_loss.detach()
-        metrics_dict["triplet_loss"] = triplet_loss.detach()
-        metrics_dict["kl_loss"] = kl_loss.detach()
-        metrics_dict["flops_loss"] = flops_loss.detach()
-
-        metrics_dict["anti_zero_loss"] = anti_zero.detach()
+        metrics_dict["avg_doc_non_zero_count"] = (
+            is_d_nonzero.sum() / (B * n_docs_per_query)
+            if B > 0 and n_docs_per_query > 0
+            else torch.tensor(0.0, device=device)
+        )
 
     # if torch.cuda.is_available(): torch.compiler.cudagraph_mark_step_end()
     return metrics_dict
