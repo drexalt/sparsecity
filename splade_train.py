@@ -254,7 +254,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 query_mask,
                 doc_ids,
                 doc_mask,
-                cfg.top_k,
+                # cfg.top_k,
                 torch.tensor(lambda_t_d, device=device),
                 torch.tensor(lambda_t_q, device=device),
                 device,
@@ -309,6 +309,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     tokenizer,
                     device,
                     sparse_embed=cfg.sparse_embed,
+                    top_k=cfg.top_k,
                 )
                 splade_model.train()
 
@@ -354,6 +355,7 @@ def main(cfg: DictConfig):
         checkpoint_path=cfg.model.checkpoint_path
         if cfg.model.checkpoint_path
         else None,
+        top_k=cfg.top_k if cfg.top_k else None,
         init_ce_temp=cfg.init_ce_temp,
         init_kl_temp=cfg.init_kl_temp,
     )

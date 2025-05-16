@@ -1,6 +1,17 @@
 from transformers import AutoModelForMaskedLM, AutoConfig
-from .splade import SpladeModel, SparseEmbedModel, SpladeModel_LearnableTemp
-from .memory_efficient import MemoryEfficientSplade, MemoryEfficientSplade_LearnableTemp
+from .splade import (
+    SpladeModel,
+    SparseEmbedModel,
+    SpladeModel_LearnableTemp,
+    SpladeModel_LearnableTemp_noTopK,
+    SpladeModel_NoTopK,
+)
+from .memory_efficient import (
+    MemoryEfficientSplade,
+    MemoryEfficientSplade_noTopK,
+    MemoryEfficientSplade_LearnableTemp,
+    MemoryEfficientSplade_LearnableTemp_noTopK,
+)
 import torch
 from typing import Optional
 
@@ -14,9 +25,12 @@ def get_splade_model(
     checkpoint_path: str = None,
     init_ce_temp: Optional[float] = 1.0,
     init_kl_temp: Optional[float] = 5.0,
+    top_k: Optional[int] = 128,
 ) -> SpladeModel:
     """
     Get a SPLADE model based on a pretrained transformer model.
+    There are many "redundant" model classes because conditionals are moved outside of the model.
+    This sometimes makes torch compile easier.
 
     Args:
         model_name: Name of the pretrained model (e.g., "bert-base-uncased", "distilbert-base-uncased")
@@ -26,9 +40,14 @@ def get_splade_model(
         checkpoint_path: Path to a checkpoint to load the model from
         init_ce_temp: Initial temperature for the CE loss
         init_kl_temp: Initial temperature for the KL loss
+        top_k: Top-k for the SPLADE activation
     Returns:
         SpladeModel instance
     """
+
+    assert (init_kl_temp is not None) == (init_ce_temp is not None), (
+        "init_kl_temp and init_ce_temp must be provided together"
+    )
 
     transformer_model = AutoModelForMaskedLM.from_pretrained(
         model_name,
@@ -52,20 +71,42 @@ def get_splade_model(
             print(f"Model keys: {model_keys}")
             print(f"State dict keys: {state_dict.keys()}")
 
+    # Annoying logic here. Honi soit qui mal y pense.
     if sparse_embed:
         splade_model = SparseEmbedModel(transformer_model).to(device)
     elif custom_kernel:
         if init_kl_temp is None:
-            splade_model = MemoryEfficientSplade(transformer_model).to(device)
+            splade_model = (
+                MemoryEfficientSplade_noTopK(transformer_model).to(device)
+                if top_k is None
+                else MemoryEfficientSplade(transformer_model, top_k).to(device)
+            )
         else:
-            splade_model = MemoryEfficientSplade_LearnableTemp(
-                transformer_model, init_ce_temp, init_kl_temp
-            ).to(device)
-    else:
+            splade_model = (
+                MemoryEfficientSplade_LearnableTemp_noTopK(
+                    transformer_model, init_ce_temp, init_kl_temp
+                ).to(device)
+                if top_k is None
+                else MemoryEfficientSplade_LearnableTemp(
+                    transformer_model, init_ce_temp, init_kl_temp, top_k
+                ).to(device)
+            )
+    else:  # No custom kernel
         if init_kl_temp is None:
-            splade_model = SpladeModel(transformer_model).to(device)
+            splade_model = (
+                SpladeModel_NoTopK(transformer_model).to(device)
+                if top_k is None
+                else SpladeModel(transformer_model, top_k).to(device)
+            )
         else:
-            splade_model = SpladeModel_LearnableTemp(
-                transformer_model, init_ce_temp, init_kl_temp
-            ).to(device)
+            splade_model = (
+                SpladeModel_LearnableTemp_noTopK(
+                    transformer_model, init_ce_temp, init_kl_temp
+                ).to(device)
+                if top_k is None
+                else SpladeModel_LearnableTemp(
+                    transformer_model, init_ce_temp, init_kl_temp, top_k
+                ).to(device)
+            )
+
     return splade_model

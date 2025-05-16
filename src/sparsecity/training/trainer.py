@@ -13,7 +13,6 @@ def train_step_mse(
     query_attention_mask: torch.Tensor,
     doc_input_ids: torch.Tensor,
     doc_attention_mask: torch.Tensor,
-    top_k: int,
     lambda_t_d: torch.Tensor,
     lambda_t_q: torch.Tensor,
     device: torch.device,
@@ -42,7 +41,6 @@ def train_step_mse(
     combined_embeddings = model(
         input_ids=combined_input_ids,
         attention_mask=combined_attention_mask,
-        top_k=top_k,
     )
     # Split the embeddings back into queries and documents
     query_embeddings = combined_embeddings[:batch_size]
@@ -155,7 +153,6 @@ def train_step_kldiv(
     query_attention_mask: torch.Tensor,
     doc_input_ids: torch.Tensor,
     doc_attention_mask: torch.Tensor,
-    top_k: int,
     lambda_t_d: torch.Tensor,
     lambda_t_q: torch.Tensor,
     device: torch.device,
@@ -184,7 +181,6 @@ def train_step_kldiv(
     combined_embeddings = model(
         input_ids=combined_input_ids,
         attention_mask=combined_attention_mask,
-        top_k=top_k,
     )
     # Split the embeddings back into queries and documents
     query_embeddings = combined_embeddings[:batch_size]
@@ -279,7 +275,6 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
     query_attention_mask: torch.Tensor,  # Shape: [B, Lq]
     doc_input_ids: torch.Tensor,  # Shape: [B, n_docs_per_query, Ld]
     doc_attention_mask: torch.Tensor,  # Shape: [B, n_docs_per_query, Ld]
-    top_k: int,
     lambda_t_d: torch.Tensor,
     lambda_t_q: torch.Tensor,
     device: torch.device,
@@ -327,9 +322,7 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         pass_1_rng_states.append(rng_ctx_for_mb)
 
         with torch.no_grad(), rng_ctx_for_mb:
-            emb_mb = model(
-                input_ids=ids_comb_mb, attention_mask=mask_comb_mb, top_k=top_k
-            )
+            emb_mb = model(input_ids=ids_comb_mb, attention_mask=mask_comb_mb)
             if embedding_dim is None:
                 embedding_dim = emb_mb.size(-1)
 
@@ -482,7 +475,6 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         emb_recompute = model(
             input_ids=ids_comb_recompute,
             attention_mask=mask_comb_recompute,
-            top_k=top_k,
         )
 
         q_recomputed = emb_recompute[:current_mini_batch_size_recompute]

@@ -100,11 +100,12 @@ class SpladeModel(nn.Module):
     SPLADE model that works with any transformer-based masked language model. Must provide top_k.
     """
 
-    def __init__(self, transformer_model: nn.Module):
+    def __init__(self, transformer_model: nn.Module, top_k: int = 128):
         super().__init__()
         self.model = transformer_model
+        self.top_k = top_k
 
-    def forward(self, input_ids, attention_mask, top_k=64):
+    def forward(self, input_ids, attention_mask):
         # Get MLM logits from transformer
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask, return_dict=True
@@ -115,7 +116,7 @@ class SpladeModel(nn.Module):
         activations = torch.log1p(F.relu(logits)) * attention_mask.unsqueeze(-1)
         values = torch.amax(activations, dim=1)
 
-        top_values, _ = torch.topk(values, k=top_k, dim=-1)
+        top_values, _ = torch.topk(values, k=self.top_k, dim=-1)
         threshold = top_values[..., -1, None]
         values = values * (values >= threshold)
 
@@ -143,3 +144,69 @@ class SpladeModel_NoTopK(nn.Module):
         values = torch.amax(activations, dim=1)
 
         return values, logits
+
+
+class SpladeModel_LearnableTemp_noTopK(nn.Module):
+    """
+    SPLADE model that works with any transformer-based masked language model. Must provide top_k.
+    """
+
+    def __init__(
+        self,
+        transformer_model: nn.Module,
+        init_ce_temp: float = 5.0,
+        init_kl_temp: float = 5.0,
+    ):
+        super().__init__()
+        self.model = transformer_model
+        self.log_t_ce = nn.Parameter(torch.log(torch.tensor(init_ce_temp)))
+        self.log_t_kl = nn.Parameter(torch.log(torch.tensor(init_kl_temp)))
+
+    @property
+    def temperature_ce(self):
+        return self.log_t_ce.exp()
+
+    @property
+    def temperature_kl(self):
+        return self.log_t_kl.exp()
+
+    def forward(self, input_ids, attention_mask):
+        # Get MLM logits from transformer
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
+        )
+        logits = outputs.logits
+
+        # SPLADE activation
+        activations = torch.log1p(F.relu(logits)) * attention_mask.unsqueeze(-1)
+        values = torch.amax(activations, dim=1)
+
+        return values
+
+
+class SpladeModel(nn.Module):
+    """
+    SPLADE model that works with any transformer-based masked language model. Must provide top_k.
+    """
+
+    def __init__(self, transformer_model: nn.Module, top_k: int = 128):
+        super().__init__()
+        self.model = transformer_model
+        self.top_k = top_k
+
+    def forward(self, input_ids, attention_mask):
+        # Get MLM logits from transformer
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
+        )
+        logits = outputs.logits
+
+        # SPLADE activation
+        activations = torch.log1p(F.relu(logits)) * attention_mask.unsqueeze(-1)
+        values = torch.amax(activations, dim=1)
+
+        top_values, _ = torch.topk(values, k=self.top_k, dim=-1)
+        threshold = top_values[..., -1, None]
+        values = values * (values >= threshold)
+
+        return values

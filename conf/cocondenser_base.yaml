@@ -11,7 +11,7 @@ data:
 use_distillation: True
 custom_kernel: True
 batch_size: 16
-mini_batch: 2
+mini_batch: 4
 num_negatives: 32
 sample_size: 8
 max_length: 256
@@ -21,7 +21,7 @@ T_d: 20000
 T_q: 20000
 T_d_start: 5000
 T_q_start: 5000
-top_k: 128
+top_k: null
 epochs: 5
 sparse_embed: False
 init_ce_temp: 1.0
