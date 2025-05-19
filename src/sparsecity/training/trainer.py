@@ -284,6 +284,7 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
     teacher_scores: Optional[
         torch.Tensor
     ] = None,  # Shape: [B, n_docs_per_query], aligns with doc_input_ids
+    mse_weight: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     # if torch.cuda.is_available(): torch.compiler.cudagraph_mark_step_begin()
     model.train()
@@ -437,7 +438,15 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
             log_target=True,
         )
 
-    total_loss = triplet_loss + flops_loss + kl_loss + anti_zero_loss
+        if teacher_scores.size(1) > 1:
+            teacher_margins = teacher_scores[:, 0].unsqueeze(1) - teacher_scores[:, 1:]
+            student_margins = (
+                student_row_logits[:, 0].unsqueeze(1) - student_row_logits[:, 1:]
+            )
+
+            mse_loss = F.mse_loss(student_margins, teacher_margins) * mse_weight
+
+    total_loss = triplet_loss + flops_loss + kl_loss + anti_zero_loss + mse_loss
 
     # --- Backward Pass using GradCache ---
     # The _recompute function is called by gc_backward_and_zero_grad for each mini-batch.
@@ -509,7 +518,7 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         metrics_dict["kl_loss"] = kl_loss.detach()
         metrics_dict["flops_loss"] = flops_loss.detach()
         metrics_dict["anti_zero_loss"] = anti_zero_loss.detach()
-
+        metrics_dict["mse_loss"] = mse_loss.detach()
         q_abs = q_emb.abs()
         d_abs = d_emb.abs()
         is_q_nonzero = q_abs > 1e-9

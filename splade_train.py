@@ -154,21 +154,23 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     # Create optimizer and scheduler
 
     # Separate learning rate for temperatures
+    if cfg.init_ce_temp is not None and cfg.init_kl_temp is not None:
+        temp_params = [splade_model.log_t_ce, splade_model.log_t_kl]
+        other_params = [
+            p
+            for n, p in splade_model.named_parameters()
+            if n not in {"log_t_ce", "log_t_kl"}
+        ]
 
-    temp_params = [splade_model.log_t_ce, splade_model.log_t_kl]
-    other_params = [
-        p
-        for n, p in splade_model.named_parameters()
-        if n not in {"log_t_ce", "log_t_kl"}
-    ]
-
-    optim_param_groups = [
-        {"params": temp_params, "lr": cfg.optimizer.learning_rate},
-        {"params": other_params, "lr": cfg.optimizer.learning_rate},
-    ]
+        optim_param_groups = [
+            {"params": temp_params, "lr": cfg.optimizer.learning_rate},
+            {"params": other_params, "lr": cfg.optimizer.learning_rate},
+        ]
 
     optimizer = AdamWScheduleFree(
-        optim_param_groups,
+        optim_param_groups
+        if cfg.init_ce_temp is not None
+        else splade_model.parameters(),
         warmup_steps=cfg.optimizer.warmup_steps,
         weight_decay=cfg.optimizer.weight_decay,
     )
@@ -245,8 +247,10 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             lambda_t_q = compute_lambda_t_delayed(
                 cfg.lambda_q, global_step, cfg.T_q_start, cfg.T_q
             )
-            mse_weight = torch.tensor(1.0, device=device)
+            mse_weight = torch.tensor(0.1, device=device)
             optimizer.train()
+            temperature_ce = torch.tensor(1.0, device=device)
+            temperature_kl = torch.tensor(5.0, device=device)
             # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             metrics = train_step_kldiv_ibn(
                 splade_model,
@@ -258,10 +262,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 torch.tensor(lambda_t_d, device=device),
                 torch.tensor(lambda_t_q, device=device),
                 device,
-                splade_model.temperature_ce,
-                splade_model.temperature_kl,
+                temperature_ce,
+                temperature_kl,
                 mini_batch=cfg.mini_batch,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
+                mse_weight=mse_weight,
             )
 
             optimized_step()
@@ -271,6 +276,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "loss/kl_loss": metrics["kl_loss"].item(),
                 "loss/flops": metrics["flops_loss"].item(),
                 "loss/anti_zero": metrics["anti_zero_loss"].item(),
+                "loss/mse": metrics["mse_loss"].item(),
                 "metrics/query_min_non_zero": metrics["query_min_non_zero"].item(),
                 "metrics/doc_min_non_zero": metrics["doc_min_non_zero"].item(),
                 "metrics/avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
@@ -281,8 +287,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
             }
 
-            metrics["metrics/kl_temp"] = splade_model.temperature_kl.detach().item()
-            metrics["metrics/ce_temp"] = splade_model.temperature_ce.detach().item()
+            # metrics["metrics/kl_temp"] = splade_model.temperature_kl.detach().item()
+            # metrics["metrics/ce_temp"] = splade_model.temperature_ce.detach().item()
 
             # For SparseEmbed models - will clean eventually when I adapt SparseEmbed for KLDiv
             # metrics = {

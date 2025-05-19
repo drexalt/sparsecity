@@ -23,8 +23,8 @@ def get_splade_model(
     sparse_embed: bool = False,
     custom_kernel: bool = False,
     checkpoint_path: str = None,
-    init_ce_temp: Optional[float] = 1.0,
-    init_kl_temp: Optional[float] = 5.0,
+    init_ce_temp: Optional[float] = None,
+    init_kl_temp: Optional[float] = None,
     top_k: Optional[int] = 128,
 ) -> SpladeModel:
     """
@@ -74,6 +74,7 @@ def get_splade_model(
     # Annoying logic here. Honi soit qui mal y pense.
     if sparse_embed:
         splade_model = SparseEmbedModel(transformer_model).to(device)
+        print("Sparse embed model loaded")
     elif custom_kernel:
         if init_kl_temp is None:
             splade_model = (
@@ -81,6 +82,10 @@ def get_splade_model(
                 if top_k is None
                 else MemoryEfficientSplade(transformer_model, top_k).to(device)
             )
+            if top_k is None:
+                print("Memory efficient no top k model loaded")
+            else:
+                print("Memory efficient top k model loaded")
         else:
             splade_model = (
                 MemoryEfficientSplade_LearnableTemp_noTopK(
@@ -91,6 +96,10 @@ def get_splade_model(
                     transformer_model, init_ce_temp, init_kl_temp, top_k
                 ).to(device)
             )
+            if top_k is None:
+                print("Memory efficient learnable temp no top k model loaded")
+            else:
+                print("Memory efficient learnable temp top k model loaded")
     else:  # No custom kernel
         if init_kl_temp is None:
             splade_model = (
@@ -98,6 +107,10 @@ def get_splade_model(
                 if top_k is None
                 else SpladeModel(transformer_model, top_k).to(device)
             )
+            if top_k is None:
+                print("Splade no top k model loaded")
+            else:
+                print("Splade top k model loaded")
         else:
             splade_model = (
                 SpladeModel_LearnableTemp_noTopK(
@@ -108,5 +121,9 @@ def get_splade_model(
                     transformer_model, init_ce_temp, init_kl_temp, top_k
                 ).to(device)
             )
+            if top_k is None:
+                print("Splade learnable temp no top k model loaded")
+            else:
+                print("Splade learnable temp top k model loaded")
 
     return splade_model
