@@ -322,7 +322,11 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         )  # Needs a tensor on the correct device
         pass_1_rng_states.append(rng_ctx_for_mb)
 
-        with torch.no_grad(), rng_ctx_for_mb:
+        with (
+            torch.no_grad(),
+            rng_ctx_for_mb,
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16),
+        ):
             emb_mb = model(input_ids=ids_comb_mb, attention_mask=mask_comb_mb)
             if embedding_dim is None:
                 embedding_dim = emb_mb.size(-1)
@@ -336,10 +340,12 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         d_emb_chunks.append(d_emb_mb)
 
     # Concatenate chunks and enable gradient tracking for these intermediate embeddings
-    q_emb = torch.cat(q_emb_chunks, 0).requires_grad_()  # Shape: [B, embedding_dim]
-    d_emb = torch.cat(
-        d_emb_chunks, 0
-    ).requires_grad_()  # Shape: [B, n_docs, embedding_dim]
+    q_emb = (
+        torch.cat(q_emb_chunks, 0).to(torch.float32).requires_grad_()
+    )  # Shape: [B, embedding_dim]
+    d_emb = (
+        torch.cat(d_emb_chunks, 0).to(torch.float32).requires_grad_()
+    )  # Shape: [B, n_docs, embedding_dim]
 
     # --- Score Calculation (In-Batch Negatives) ---
     # For each query q_i, the positive is d_emb[i,0,:] (the first document associated with q_i).
@@ -481,10 +487,11 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
 
         # Re-execute model forward pass for this mini-batch with gradient tracking enabled.
         # The provided rng_ctx_for_mb_recompute ensures consistent RNG.
-        emb_recompute = model(
-            input_ids=ids_comb_recompute,
-            attention_mask=mask_comb_recompute,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            emb_recompute = model(
+                input_ids=ids_comb_recompute,
+                attention_mask=mask_comb_recompute,
+            )
 
         q_recomputed = emb_recompute[:current_mini_batch_size_recompute]
         d_recomputed = emb_recompute[current_mini_batch_size_recompute:].reshape(

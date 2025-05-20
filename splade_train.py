@@ -247,7 +247,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             lambda_t_q = compute_lambda_t_delayed(
                 cfg.lambda_q, global_step, cfg.T_q_start, cfg.T_q
             )
-            mse_weight = torch.tensor(0.1, device=device)
+            mse_weight = torch.tensor(0.05, device=device)
             optimizer.train()
             temperature_ce = torch.tensor(1.0, device=device)
             temperature_kl = torch.tensor(5.0, device=device)
