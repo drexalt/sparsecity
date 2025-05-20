@@ -25,8 +25,6 @@ from omegaconf import DictConfig
 from schedulefree import AdamWScheduleFree
 from sparsecity.data.dataset import KDProcessing
 
-# from heavyball.utils import trust_region_clip_, rmsnorm_clip_
-# from heavyball.utils import set_torch
 from heapq import heappush, heappop
 
 torch.set_float32_matmul_precision("high")
@@ -174,6 +172,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         warmup_steps=cfg.optimizer.warmup_steps,
         weight_decay=cfg.optimizer.weight_decay,
     )
+
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
     if cfg.use_distillation:
@@ -247,11 +246,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             lambda_t_q = compute_lambda_t_delayed(
                 cfg.lambda_q, global_step, cfg.T_q_start, cfg.T_q
             )
-            mse_weight = torch.tensor(0.05, device=device)
+
             optimizer.train()
+
+            mse_weight = torch.tensor(0.05, device=device)
             temperature_ce = torch.tensor(1.0, device=device)
             temperature_kl = torch.tensor(5.0, device=device)
-            # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             metrics = train_step_kldiv_ibn(
                 splade_model,
                 query_ids,
@@ -269,6 +269,16 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 mse_weight=mse_weight,
             )
 
+            # Gradient clipping: don't start clipping until after warmup
+            if global_step > cfg.optimizer.warmup_steps:
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    splade_model.parameters(), max_norm=cfg.optimizer.max_grad_norm
+                )
+            else:
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    splade_model.parameters(), max_norm=float("inf")
+                )
+
             optimized_step()
             metrics = {
                 "loss/total_loss": metrics["loss"].item(),
@@ -285,6 +295,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     "query_median_non_zero"
                 ].item(),
                 "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
+                "metrics/total_grad_norm": total_grad_norm.item(),
             }
 
             # metrics["metrics/kl_temp"] = splade_model.temperature_kl.detach().item()
