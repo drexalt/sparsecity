@@ -408,13 +408,15 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
     triplet_loss = F.cross_entropy(scores_for_ce, labels)
 
     # 2. FLOPs Regularization (L1 norm on embeddings)
-    doc_l1_sum_abs_mean = torch.sum(
-        d_all_docs_flat.abs(), dim=-1
-    ).mean()  # L1 norm per doc, then mean
-    query_l1_sum_abs_mean = torch.sum(
-        q_emb.abs(), dim=-1
-    ).mean()  # L1 norm per query, then mean
-    flops_loss = lambda_t_d * doc_l1_sum_abs_mean + lambda_t_q * query_l1_sum_abs_mean
+    doc_mean = d_all_docs_flat.mean(dim=0)  # shape (D,)
+    query_mean = q_emb.mean(dim=0)  # shape (D,)
+
+    # 2.  squared L2 of those means  (== “sum of squared means”)
+    flops_d = (doc_mean * doc_mean).sum()  # scalar
+    flops_q = (query_mean * query_mean).sum()  # scalar
+
+    # 3.  combine with the (already-scheduled) λ’s
+    flops_loss = lambda_t_d * flops_d + lambda_t_q * flops_q
 
     # 3. Anti-Zero Loss
     q_total_sum_sq_inv = torch.reciprocal(
@@ -452,7 +454,7 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
 
             mse_loss = F.mse_loss(student_margins, teacher_margins) * mse_weight
 
-    total_loss = triplet_loss + flops_loss + kl_loss + anti_zero_loss + mse_loss
+    total_loss = triplet_loss + flops_loss + kl_loss + mse_loss + anti_zero_loss
 
     # --- Backward Pass using GradCache ---
     # The _recompute function is called by gc_backward_and_zero_grad for each mini-batch.
@@ -493,9 +495,13 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
                 attention_mask=mask_comb_recompute,
             )
 
-        q_recomputed = emb_recompute[:current_mini_batch_size_recompute]
-        d_recomputed = emb_recompute[current_mini_batch_size_recompute:].reshape(
-            current_mini_batch_size_recompute, n_docs_per_query, embedding_dim
+        q_recomputed = emb_recompute[:current_mini_batch_size_recompute].to(
+            torch.float32
+        )
+        d_recomputed = (
+            emb_recompute[current_mini_batch_size_recompute:]
+            .reshape(current_mini_batch_size_recompute, n_docs_per_query, embedding_dim)
+            .to(torch.float32)
         )
         return [
             q_recomputed,
