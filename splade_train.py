@@ -258,6 +258,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         models=[splade_model, splade_model],
         chunk_sizes=cfg.mini_batch,
         loss_fn=contrastive_kd_loss,
+        mixed_precision="bf16",
     )
 
     # Training loop

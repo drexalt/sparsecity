@@ -1,7 +1,8 @@
 import torch
 from typing import Sequence, Callable, List, Union, Any, Tuple, Dict
 from torch.utils.checkpoint import get_device_states, set_device_states
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch import nn, Tensor
 from contextlib import nullcontext
 from collections import UserDict
@@ -108,7 +109,7 @@ class GradCache:
         loss_fn: Callable[..., Tensor],
         split_input_fn: Callable[[Any, int], Any] = None,
         get_rep_fn: Callable[..., Tensor] = None,
-        fp16: bool = False,
+        mixed_precision: str = "fp32",
         scaler: GradScaler = None,
     ):
         """
@@ -136,14 +137,10 @@ class GradCache:
         self.get_rep_fn = get_rep_fn
         self.loss_fn = loss_fn
 
-        if fp16:
-            assert scaler is not None, (
-                "mixed precision training requires a gradient scaler passed in"
-            )
-
-        self.fp16 = fp16
-        self.scaler = scaler
-
+        self.mixed_precision = mixed_precision
+        if mixed_precision == "fp16":
+            assert scaler is not None, "fp16 requires a gradient scaler"
+        self.scaler = scaler if mixed_precision == "fp16" else None
         self._get_input_tensors_strict = False
 
     def __call__(self, *args, **kwargs):
@@ -228,7 +225,18 @@ class GradCache:
         :param model_input: input to the model call
         :return: model output
         """
-        with autocast() if self.fp16 else nullcontext():
+        dtype = (
+            torch.float16
+            if self.mixed_precision == "fp16"
+            else torch.bfloat16
+            if self.mixed_precision == "bf16"
+            else None
+        )
+        with (
+            autocast("cuda", dtype=dtype)
+            if self.mixed_precision != "none"
+            else nullcontext()
+        ):
             if isinstance(model_input, Tensor):
                 return model(model_input)
             elif isinstance(model_input, list):
@@ -300,7 +308,18 @@ class GradCache:
         :return: A tuple of a) gradient cache for each encoder model, and b) loss tensor
         """
         reps = [r.detach().requires_grad_() for r in reps]
-        with autocast() if self.fp16 else nullcontext():
+        dtype = (
+            torch.float16
+            if self.mixed_precision == "fp16"
+            else torch.bfloat16
+            if self.mixed_precision == "bf16"
+            else None
+        )
+        with (
+            autocast("cuda", dtype=dtype)
+            if self.mixed_precision != "none"
+            else nullcontext()
+        ):
             loss_out = self.compute_loss(
                 *reps, **loss_kwargs
             )  # Returns tuple (total_loss, {parts})
@@ -310,7 +329,7 @@ class GradCache:
         else:
             loss, parts = loss_out, {}
 
-        if self.fp16:
+        if self.mixed_precision == "fp16":
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
