@@ -3,7 +3,8 @@ from jaxtyping import Float, Int
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .grad_cache import gc_backward_and_zero_grad, RandContext
+from torch import Tensor
+from .grad_cache import gc_backward_and_zero_grad, RandContext, GradCache
 
 
 # @torch.compile(mode="default")
@@ -268,6 +269,13 @@ def train_step_kldiv(
     return metrics
 
 
+def rng_fingerprint():
+    """Return a cheap 64-bit digest of *all* CUDA & CPU generators."""
+    cpu = torch.randint(0, 2**31 - 1, (1,)).item()
+    g = torch.cuda.initial_seed()  # current default CUDA generator
+    return (cpu, g)
+
+
 # @torch.compile(mode="max-autotune") # Kept commented as in source _vectorized version
 def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
     model: nn.Module,
@@ -285,6 +293,7 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         torch.Tensor
     ] = None,  # Shape: [B, n_docs_per_query], aligns with doc_input_ids
     mse_weight: Optional[torch.Tensor] = None,
+    global_step: int = 0,
 ) -> Dict[str, torch.Tensor]:
     # if torch.cuda.is_available(): torch.compiler.cudagraph_mark_step_begin()
     model.train()
@@ -324,8 +333,8 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
 
         with (
             torch.no_grad(),
-            rng_ctx_for_mb,
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16),
+            # rng_ctx_for_mb,
+            # torch.autocast(device_type="cuda", dtype=torch.bfloat16),
         ):
             emb_mb = model(input_ids=ids_comb_mb, attention_mask=mask_comb_mb)
             if embedding_dim is None:
@@ -340,12 +349,10 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         d_emb_chunks.append(d_emb_mb)
 
     # Concatenate chunks and enable gradient tracking for these intermediate embeddings
-    q_emb = (
-        torch.cat(q_emb_chunks, 0).to(torch.float32).requires_grad_()
-    )  # Shape: [B, embedding_dim]
-    d_emb = (
-        torch.cat(d_emb_chunks, 0).to(torch.float32).requires_grad_()
-    )  # Shape: [B, n_docs, embedding_dim]
+    q_emb = torch.cat(q_emb_chunks, 0).requires_grad_()  # Shape: [B, embedding_dim]
+    d_emb = torch.cat(
+        d_emb_chunks, 0
+    ).requires_grad_()  # Shape: [B, n_docs, embedding_dim]
 
     # --- Score Calculation (In-Batch Negatives) ---
     # For each query q_i, the positive is d_emb[i,0,:] (the first document associated with q_i).
@@ -357,7 +364,7 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
     # Full score matrix: query_i vs all_doc_j
     # scores_q_vs_all_docs[i,j] = score(q_emb[i], d_all_docs_flat[j])
     scores_q_vs_all_docs = torch.matmul(
-        q_emb, d_all_docs_flat.T
+        q_emb.float(), d_all_docs_flat.float().T
     )  # Shape: [B, B * n_docs_per_query]
 
     # Labels for CrossEntropyLoss: positive is always at index 0 after gathering
@@ -433,10 +440,12 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
         # teacher_scores shape: [B, n_docs_per_query]
         # Student scores for q_i vs its *own* n_docs_per_query documents: d_emb[i, :, :]
         student_row_logits = torch.einsum(
-            "bv,bnv->bn", q_emb, d_emb
+            "bv,bnv->bn", q_emb.float(), d_emb.float()
         )  # Shape: [B, n_docs_per_query]
 
-        teacher_log_softmax = F.log_softmax(teacher_scores / temperature_kl, dim=-1)
+        teacher_log_softmax = F.log_softmax(
+            teacher_scores.float() / temperature_kl, dim=-1
+        )
         student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
 
         kl_loss = F.kl_div(
@@ -489,25 +498,31 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
 
         # Re-execute model forward pass for this mini-batch with gradient tracking enabled.
         # The provided rng_ctx_for_mb_recompute ensures consistent RNG.
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            emb_recompute = model(
-                input_ids=ids_comb_recompute,
-                attention_mask=mask_comb_recompute,
-            )
-
-        q_recomputed = emb_recompute[:current_mini_batch_size_recompute].to(
-            torch.float32
+        # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        emb_recompute = model(
+            input_ids=ids_comb_recompute,
+            attention_mask=mask_comb_recompute,
         )
-        d_recomputed = (
-            emb_recompute[current_mini_batch_size_recompute:]
-            .reshape(current_mini_batch_size_recompute, n_docs_per_query, embedding_dim)
-            .to(torch.float32)
+
+        q_recomputed = emb_recompute[:current_mini_batch_size_recompute]
+        d_recomputed = emb_recompute[current_mini_batch_size_recompute:].reshape(
+            current_mini_batch_size_recompute, n_docs_per_query, embedding_dim
         )
         return [
             q_recomputed,
             d_recomputed,
         ]  # Must return in same order as tensors in second argument to gc_backward_and_zero_grad
 
+    if global_step % 500 == 0:
+        sl = slice(0, mini_batch)  # the slice you replay
+        with pass_1_rng_states[0]:
+            replay_q = _recompute_for_gradcache(  # bf16 tensor
+                sl, pass_1_rng_states[0]
+            )[0]
+
+        # compare only that slice
+        max_diff = (q_emb[sl] - replay_q).abs().max()
+        print(f"step {global_step}  max diff {max_diff.item():.6g}")
     # gc_backward_and_zero_grad handles the chunked backward pass.
     # It recomputes activations for each chunk via _recompute_for_gradcache,
     # then backpropagates gradients for that chunk, and finally zeros model gradients.
@@ -575,3 +590,50 @@ def train_step_kldiv_ibn(  # Refactored from train_step_kldiv_ibn_vectorized
 
     # if torch.cuda.is_available(): torch.compiler.cudagraph_mark_step_end()
     return metrics_dict
+
+
+def train_step_kldiv_gradcache(
+    gc: GradCache,
+    model: nn.Module,
+    query_input_ids: Tensor,
+    query_attention_mask: Tensor,
+    doc_input_ids: Tensor,
+    doc_attention_mask: Tensor,
+    lambda_t_d: Tensor,
+    lambda_t_q: Tensor,
+    temperature_ce: Tensor,
+    temperature_kl: Tensor,
+    teacher_scores: Optional[Tensor] = None,
+    mse_weight: Optional[Tensor] = None,
+) -> Dict[str, Tensor]:
+    model.train()
+
+    B, n_docs_per_query, Ld = doc_input_ids.shape
+
+    # ----------------- per‑encoder inputs ------------------------------------
+    query_inp = {
+        "input_ids": query_input_ids,
+        "attention_mask": query_attention_mask,
+    }
+    doc_inp = {
+        "input_ids": doc_input_ids.view(B * n_docs_per_query, Ld),
+        "attention_mask": doc_attention_mask.view(B * n_docs_per_query, Ld),
+    }
+
+    # ----------------- forward + backward via GradCache -----------------------
+    total_loss, loss_parts = gc(
+        query_inp,
+        doc_inp,
+        n_docs_per_query=n_docs_per_query,
+        lambda_t_d=lambda_t_d,
+        lambda_t_q=lambda_t_q,
+        temperature_ce=temperature_ce,
+        temperature_kl=temperature_kl,
+        teacher_scores=teacher_scores,
+        mse_weight=mse_weight,
+    )
+    metrics: Dict[str, Tensor] = {"total_loss": total_loss.detach()}
+
+    metrics.update({k: v.detach() for k, v in loss_parts.items()})
+
+    return metrics

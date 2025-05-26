@@ -1,5 +1,9 @@
 # from sparsecity.training.trainer import train_step
-from sparsecity.training.trainer import train_step_kldiv_ibn, train_step_mse
+from sparsecity.training.trainer import (
+    train_step_kldiv_ibn,
+    train_step_mse,
+    train_step_kldiv_gradcache,
+)
 from datetime import datetime
 
 # from sparsecity.training.sparse_trainer import train_step
@@ -9,6 +13,8 @@ from sparsecity.data.dataset import (
     KDProcessingCollateFn,
 )
 from sparsecity.models.splade_models.model_registry import get_splade_model
+from sparsecity.training.grad_cache import GradCache
+from sparsecity.training.losses import contrastive_kd_loss
 from sparsecity.evaluation.validate import validate_model
 from sentence_transformers.evaluation import NanoBEIREvaluator
 from sentence_transformers.similarity_functions import dot_score
@@ -24,6 +30,7 @@ import hydra
 from omegaconf import DictConfig
 from schedulefree import AdamWScheduleFree
 from sparsecity.data.dataset import KDProcessing
+from transformers import get_linear_schedule_with_warmup
 
 from heapq import heappush, heappop
 
@@ -132,11 +139,6 @@ def compute_lambda_t_delayed(
 
 
 def train_model(splade_model, tokenizer, cfg, dataset):
-    # Set random seed for reproducibility
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(cfg.seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Move models to device
@@ -164,6 +166,26 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             {"params": temp_params, "lr": cfg.optimizer.learning_rate},
             {"params": other_params, "lr": cfg.optimizer.learning_rate},
         ]
+
+    # warmup_steps = cfg.optimizer.warmup_steps
+
+    # def lambda_lr(step):
+    #     if warmup_steps == 0:
+    #         return 1.0
+    #     return min(1, step / warmup_steps)
+
+    # optimizer = torch.optim.AdamW(
+    #     optim_param_groups
+    #     if cfg.init_ce_temp is not None
+    #     else splade_model.parameters(),
+    #     lr=cfg.optimizer.learning_rate,
+    #     weight_decay=cfg.optimizer.weight_decay,
+    # )
+
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(
+    #     optimizer,
+    #     lambda_lr,
+    # )
 
     optimizer = AdamWScheduleFree(
         optim_param_groups
@@ -226,9 +248,17 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     def optimized_step():
         optimizer.step()
+        # scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
     global_step = 0
+
+    # Grad Cache
+    gc = GradCache(
+        models=[splade_model, splade_model],
+        chunk_sizes=cfg.mini_batch,
+        loss_fn=contrastive_kd_loss,
+    )
 
     # Training loop
     for epoch in range(cfg.epochs):
@@ -252,25 +282,24 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             mse_weight = torch.tensor(0.05, device=device)
             temperature_ce = torch.tensor(1.0, device=device)
             temperature_kl = torch.tensor(5.0, device=device)
-            metrics = train_step_kldiv_ibn(
-                splade_model,
-                query_ids,
-                query_mask,
-                doc_ids,
-                doc_mask,
+            metrics = train_step_kldiv_gradcache(
+                gc,
+                model=splade_model,
+                query_input_ids=query_ids,
+                query_attention_mask=query_mask,
+                doc_input_ids=doc_ids,
+                doc_attention_mask=doc_mask,
                 # cfg.top_k,
-                torch.tensor(lambda_t_d, device=device),
-                torch.tensor(lambda_t_q, device=device),
-                device,
-                temperature_ce,
-                temperature_kl,
-                mini_batch=cfg.mini_batch,
+                lambda_t_d=torch.tensor(lambda_t_d, device=device),
+                lambda_t_q=torch.tensor(lambda_t_q, device=device),
+                temperature_ce=temperature_ce,
+                temperature_kl=temperature_kl,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
                 mse_weight=mse_weight,
             )
 
             # Gradient clipping: don't start clipping until after warmup
-            if global_step > cfg.optimizer.warmup_steps:
+            if global_step > cfg.optimizer.grad_clip_warmup_steps:
                 total_grad_norm = torch.nn.utils.clip_grad_norm_(
                     splade_model.parameters(), max_norm=cfg.optimizer.max_grad_norm
                 )
@@ -281,7 +310,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             optimized_step()
             metrics = {
-                "loss/total_loss": metrics["loss"].item(),
+                "loss/total_loss": metrics["total_loss"].item(),
                 "loss/triplet_loss": metrics["triplet_loss"].item(),
                 "loss/kl_loss": metrics["kl_loss"].item(),
                 "loss/flops": metrics["flops_loss"].item(),
@@ -376,10 +405,14 @@ def main(cfg: DictConfig):
         init_ce_temp=cfg.init_ce_temp,
         init_kl_temp=cfg.init_kl_temp,
     )
-    # dataset = load_dataset(
+    # train_dataset = load_dataset(
     #     cfg.data.name,
     #     split=cfg.data.split,
     # )
+    # Set random seed for reproducibility
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
 
     train_dataset = load_dataset(
         "lightonai/ms-marco-en-bge-gemma",

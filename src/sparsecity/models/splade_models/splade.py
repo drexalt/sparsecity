@@ -143,7 +143,7 @@ class SpladeModel_NoTopK(nn.Module):
         activations = torch.log1p(F.relu(logits)) * attention_mask.unsqueeze(-1)
         values = torch.amax(activations, dim=1)
 
-        return values, logits
+        return values
 
 
 class SpladeModel_LearnableTemp_noTopK(nn.Module):
