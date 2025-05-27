@@ -430,7 +430,13 @@ class MultipleNegativesDistilCollateFn:
 
 
 class KDProcessingCollateFn:
-    def __init__(self, tokenizer, num_negatives: int = 32, sample_size: int = 8):
+    def __init__(
+        self,
+        tokenizer,
+        num_negatives: int = 32,
+        sample_size: int = 8,
+        proximity_threshold: float = None,
+    ):
         """
         Initialize the collator with a tokenizer and number of negatives.
         Also modified from PyLate collate function: https://github.com/lightonai/pylate/tree/main/pylate/utils
@@ -442,6 +448,7 @@ class KDProcessingCollateFn:
         self.tokenizer = tokenizer
         self.num_negatives = num_negatives
         self.sample_size = sample_size
+        self.proximity_threshold = proximity_threshold
         self.max_length = self.tokenizer.model_max_length
 
     def __call__(
@@ -487,6 +494,13 @@ class KDProcessingCollateFn:
 
             # Collect negatives: all documents except the positive
             neg_indices = [i for i in range(len(docs)) if i != pos_idx]
+
+            if self.proximity_threshold is not None:
+                neg_indices = [
+                    i
+                    for i in neg_indices
+                    if abs(scores[i] - pos_score) > self.proximity_threshold
+                ]
 
             # Determine the number of negatives to sample
             sample_size = min(self.sample_size, len(neg_indices))

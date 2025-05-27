@@ -14,7 +14,10 @@ from sparsecity.data.dataset import (
 )
 from sparsecity.models.splade_models.model_registry import get_splade_model
 from sparsecity.training.grad_cache import GradCache
-from sparsecity.training.losses import contrastive_kd_loss
+from sparsecity.training.losses import (
+    contrastive_kd_loss,
+    contrastive_kd_loss_with_hard_negatives,
+)
 from sparsecity.evaluation.validate import validate_model
 from sentence_transformers.evaluation import NanoBEIREvaluator
 from sentence_transformers.similarity_functions import dot_score
@@ -50,6 +53,7 @@ class TrainingConfig:
     num_negatives: int
     sample_size: int  # Number of negatives to sample from total num_negatives
     n_ways: int  # How many negatives to throw into InfoNCE loss
+    proximity_threshold: float
     max_length: int
     lambda_d: float
     lambda_q: float
@@ -202,7 +206,10 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         dataloader = DataLoader(
             dataset,
             collate_fn=KDProcessingCollateFn(
-                tokenizer, num_negatives=cfg.num_negatives, sample_size=cfg.sample_size
+                tokenizer,
+                num_negatives=cfg.num_negatives,
+                sample_size=cfg.sample_size,
+                proximity_threshold=cfg.proximity_threshold,
             ),
             batch_size=cfg.batch_size,
             shuffle=True,
@@ -258,7 +265,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     gc = GradCache(
         models=[splade_model, splade_model],
         chunk_sizes=cfg.mini_batch,
-        loss_fn=contrastive_kd_loss,
+        loss_fn=contrastive_kd_loss_with_hard_negatives,
         mixed_precision="bf16",
     )
 
