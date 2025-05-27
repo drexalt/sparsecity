@@ -49,6 +49,7 @@ class TrainingConfig:
     mini_batch: int
     num_negatives: int
     sample_size: int  # Number of negatives to sample from total num_negatives
+    n_ways: int  # How many negatives to throw into InfoNCE loss
     max_length: int
     lambda_d: float
     lambda_q: float
@@ -295,6 +296,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 lambda_t_q=torch.tensor(lambda_t_q, device=device),
                 temperature_ce=temperature_ce,
                 temperature_kl=temperature_kl,
+                n_ways=cfg.n_ways,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
                 mse_weight=mse_weight,
             )

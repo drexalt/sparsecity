@@ -11,9 +11,10 @@ data:
 use_distillation: True
 custom_kernel: True
 batch_size: 32
-mini_batch: 16
+mini_batch: 64
 num_negatives: 32
 sample_size: 16
+n_ways: 16
 max_length: 256
 lambda_d: 9e-4
 lambda_q: 5e-4

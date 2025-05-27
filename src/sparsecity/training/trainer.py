@@ -603,6 +603,7 @@ def train_step_kldiv_gradcache(
     lambda_t_q: Tensor,
     temperature_ce: Tensor,
     temperature_kl: Tensor,
+    n_ways: Optional[int] = 32,
     teacher_scores: Optional[Tensor] = None,
     mse_weight: Optional[Tensor] = None,
 ) -> Dict[str, Tensor]:
@@ -629,6 +630,7 @@ def train_step_kldiv_gradcache(
         lambda_t_q=lambda_t_q,
         temperature_ce=temperature_ce,
         temperature_kl=temperature_kl,
+        n_ways=n_ways,
         teacher_scores=teacher_scores,
         mse_weight=mse_weight,
     )

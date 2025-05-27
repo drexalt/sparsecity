@@ -149,6 +149,7 @@ def contrastive_kd_loss(
     lambda_t_q: Tensor,
     temperature_ce: Tensor,
     temperature_kl: Tensor,
+    n_ways: Optional[int] = 32,
     teacher_scores: Optional[Tensor] = None,  # [B, n_docs]
     mse_weight: Optional[Tensor] = None,
 ) -> Tensor:
@@ -181,6 +182,10 @@ def contrastive_kd_loss(
         B, -1
     )  # [B, B*n_docs]
     neg_cols = all_cols[neg_mask].view(B, -1)  # [B, (B-1)*n_docs]
+
+    if n_ways is not None and n_ways < neg_cols.size(1):
+        neg_indices = torch.randperm(neg_cols.size(1), device=device)[:n_ways]
+        neg_cols = neg_cols[:, neg_indices]
 
     gather_cols = torch.cat([pos_cols, neg_cols], dim=1)  # [B, 1+(B-1)*n_docs]
 
