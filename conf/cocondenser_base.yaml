@@ -14,13 +14,13 @@ batch_size: 32
 mini_batch: 64
 num_negatives: 32
 sample_size: 16
-n_ways: 16
+n_ways: 32
 proximity_threshold: 0.05
 max_length: 256
-lambda_d: 9e-4
-lambda_q: 5e-4
-T_d: 200000
-T_q: 200000
+lambda_d: 0.002
+lambda_q: 0.002
+T_d: 1000
+T_q: 1000
 T_d_start: 0
 T_q_start: 0
 top_k: null
@@ -29,9 +29,9 @@ sparse_embed: False
 init_ce_temp: null
 init_kl_temp: null
 optimizer:
-  learning_rate: 8e-5
-  warmup_steps: 4000
-  grad_clip_warmup_steps: 8000
+  learning_rate: 2e-4
+  warmup_steps: 200
+  grad_clip_warmup_steps: 800
   weight_decay: 0.01
   max_grad_norm: 15.0
 checkpoint:
