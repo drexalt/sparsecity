@@ -66,7 +66,7 @@ def calculate_contrastive_loss(
     return F.cross_entropy(scores / temperature, labels)
 
 
-def calculate_flops_regularization(
+def calculate_OLD_L1_flops_regularization(
     query_embeddings: torch.Tensor,  # [B, V]
     doc_embeddings: torch.Tensor,  # [B, N, V] or [B*N, V]
     lambda_q: torch.Tensor,
@@ -80,6 +80,23 @@ def calculate_flops_regularization(
 
     doc_l1 = torch.sum(doc_embeddings_flat.abs(), dim=-1).mean()
     query_l1 = torch.sum(query_embeddings.abs(), dim=-1).mean()
+    return lambda_d * doc_l1 + lambda_q * query_l1
+
+
+def calculate_flops_regularization(
+    query_embeddings: torch.Tensor,  # [B, V]
+    doc_embeddings: torch.Tensor,  # [B, N, V] or [B*N, V]
+    lambda_q: torch.Tensor,
+    lambda_d: torch.Tensor,
+) -> torch.Tensor:
+    """Computes L1 regularization loss on embeddings (proxy for FLOPs)."""
+    if doc_embeddings.dim() == 3:  # [B, N, V]
+        doc_embeddings_flat = doc_embeddings.reshape(-1, doc_embeddings.shape[-1])
+    else:  # Assumed [B*N, V]
+        doc_embeddings_flat = doc_embeddings
+
+    doc_l1 = torch.sum((doc_embeddings_flat.abs().mean(dim=0) ** 2))
+    query_l1 = torch.sum((query_embeddings.abs().mean(dim=0) ** 2))
     return lambda_d * doc_l1 + lambda_q * query_l1
 
 
@@ -109,11 +126,9 @@ def calculate_kl_divergence_distillation(
     )
 
     student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
-    teacher_log_softmax = F.log_softmax(teacher_scores / temperature_kl, dim=-1)
+    teacher_log_softmax = F.softmax(teacher_scores / temperature_kl, dim=-1)
 
-    return F.kl_div(
-        student_log_softmax, teacher_log_softmax, reduction="batchmean", log_target=True
-    )
+    return F.kl_div(student_log_softmax, teacher_log_softmax, reduction="batchmean")
 
 
 def calculate_margin_mse_distillation(
@@ -485,5 +500,5 @@ def contrastive_kd_loss_with_hard_negatives(
         "avg_doc_non_zero_count": avg_doc_non_zero_count,
     }
 
-    total_loss: Tensor = triplet_loss + flops_loss + anti_zero_loss + kl_loss + mse_loss
+    total_loss: Tensor = triplet_loss + flops_loss + kl_loss + mse_loss
     return total_loss, parts

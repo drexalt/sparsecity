@@ -18,10 +18,11 @@ from sparsecity.training.losses import (
     contrastive_kd_loss,
     contrastive_kd_loss_with_hard_negatives,
 )
+from sparsecity.utils.utils import flatten_dict
 from sparsecity.evaluation.validate import validate_model
 from sentence_transformers.evaluation import NanoBEIREvaluator
 from sentence_transformers.similarity_functions import dot_score
-from transformers import AutoTokenizer, BertConfig
+from transformers import AutoTokenizer, AutoConfig
 import os
 import torch
 from torch.utils.data import DataLoader
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig
+import dataclasses
 from schedulefree import AdamWScheduleFree
 from sparsecity.data.dataset import KDProcessing
 from transformers import get_linear_schedule_with_warmup
@@ -239,14 +241,24 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         wandb.init(
             project=cfg.wandb_project,
             config={
-                "batch_size": cfg.batch_size,
-                "mini_batch": cfg.mini_batch,
-                "learning_rate": cfg.optimizer.learning_rate,
-                "warmup_steps": cfg.optimizer.warmup_steps,
                 "optimizer": optimizer.__class__.__name__,
-                "sparse_embed": cfg.sparse_embed,
+                **(flatten_dict(dataclasses.asdict(cfg))),
             },
+            config_exclude_keys=[
+                "data",
+                "seed",
+                "checkpoint/checkpoint_path",
+                "checkpoint/max_to_keep",
+                "checkpoint/save_interval_steps",
+                "evaluation/eval_every_steps",
+                "evaluation/datasets",
+                "evaluation/batch_size",
+                "wandb",
+                "wandb_project",
+                "log_every",
+            ],
         )
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_directory = os.path.join(
         hydra.utils.to_absolute_path(cfg.checkpoint.checkpoint_path), timestamp
@@ -290,7 +302,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             mse_weight = torch.tensor(0.05, device=device)
             temperature_ce = torch.tensor(1.0, device=device)
-            temperature_kl = torch.tensor(5.0, device=device)
+            temperature_kl = torch.tensor(1.0, device=device)
             metrics = train_step_kldiv_gradcache(
                 gc,
                 model=splade_model,
@@ -401,7 +413,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 @hydra.main(config_path="conf", config_name="cocondenser_base", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
-    config = BertConfig.from_pretrained(cfg.model.name)
+    config = AutoConfig.from_pretrained(cfg.model.name)
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model = get_splade_model(
         cfg.model.name,
