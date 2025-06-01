@@ -5,6 +5,7 @@ from sparsecity.training.trainer import (
     train_step_kldiv_gradcache,
 )
 from datetime import datetime
+from collections import deque
 
 # from sparsecity.training.sparse_trainer import train_step
 from sparsecity.data.dataset import (
@@ -18,7 +19,7 @@ from sparsecity.training.losses import (
     contrastive_kd_loss,
     contrastive_kd_loss_with_hard_negatives,
 )
-from sparsecity.utils.utils import flatten_dict
+from sparsecity.utils.utils import flatten_dict, dump_debug_bundle
 from sparsecity.evaluation.validate import validate_model
 from sentence_transformers.evaluation import NanoBEIREvaluator
 from sentence_transformers.similarity_functions import dot_score
@@ -38,6 +39,7 @@ from sparsecity.data.dataset import KDProcessing
 from transformers import get_linear_schedule_with_warmup
 
 from heapq import heappush, heappop
+import logging
 
 torch.set_float32_matmul_precision("high")
 torch._dynamo.reset()
@@ -74,6 +76,9 @@ class TrainingConfig:
     wandb_project: str
     use_distillation: bool
     evaluation: DictConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 def save_checkpoint(
@@ -279,7 +284,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         chunk_sizes=cfg.mini_batch,
         loss_fn=contrastive_kd_loss_with_hard_negatives,
         mixed_precision="bf16",
+        rep_grad_clip=cfg.optimizer.rep_grad_clip,
+        clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
     )
+
+    safe_grad_window = deque(maxlen=200)
 
     # Training loop
     for epoch in range(cfg.epochs):
@@ -321,14 +330,37 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             )
 
             # Gradient clipping: don't start clipping until after warmup
-            if global_step > cfg.optimizer.grad_clip_warmup_steps:
-                total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    splade_model.parameters(), max_norm=cfg.optimizer.max_grad_norm
+            # if global_step > cfg.optimizer.grad_clip_warmup_steps:
+            #     total_grad_norm = torch.nn.utils.clip_grad_norm_(
+            #         splade_model.parameters(), max_norm=cfg.optimizer.max_grad_norm
+            #     )
+            # else:
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                splade_model.parameters(), max_norm=float("inf")
+            )
+
+            total_grad_norm_val = total_grad_norm.item()
+
+            exploded = not torch.isfinite(total_grad_norm) or (
+                len(safe_grad_window) == safe_grad_window.maxlen
+                and total_grad_norm_val > 10 * max(safe_grad_window)
+            )
+
+            safe_grad_window.append(total_grad_norm_val)
+            if exploded:
+                dump_debug_bundle(
+                    batch,
+                    splade_model,
+                    optimizer,
+                    global_step,
+                    path=checkpoint_directory,
                 )
-            else:
-                total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    splade_model.parameters(), max_norm=float("inf")
+                logger.error(
+                    f"Gradient explosion at step {global_step}. Skipping batch. Batch logged to {checkpoint_directory}/debug_step_{global_step}.pt"
                 )
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
 
             optimized_step()
             metrics = {

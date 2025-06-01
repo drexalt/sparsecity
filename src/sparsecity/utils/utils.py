@@ -1,4 +1,6 @@
 from omegaconf import OmegaConf, DictConfig
+import os
+import torch
 
 
 def flatten_dict(d, parent_key="", sep="/"):
@@ -24,3 +26,16 @@ def flatten_dict(d, parent_key="", sep="/"):
         else:
             items.append((new_key, v))
     return dict(items)
+
+
+def dump_debug_bundle(batch, model, optimizer, step, path="debug_dumps"):
+    os.makedirs(path, exist_ok=True)
+    torch.save(
+        {
+            "step": step,
+            "batch": {k: v.cpu() for k, v in batch.items()},
+            "model_state": model.state_dict(),
+            "optim_state": optimizer.state_dict(),
+        },
+        f"{path}/debug_step_{step}.pt",
+    )

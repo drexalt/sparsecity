@@ -7,6 +7,11 @@ from torch import nn, Tensor
 from contextlib import nullcontext
 from collections import UserDict
 from itertools import repeat
+import wandb
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class RandContext:
@@ -111,6 +116,8 @@ class GradCache:
         get_rep_fn: Callable[..., Tensor] = None,
         mixed_precision: str = "fp32",
         scaler: GradScaler = None,
+        rep_grad_clip: float | None = None,
+        clip_start_step: int | None = 0,
     ):
         """
         Initialize the Gradient Cache class instance.
@@ -142,6 +149,9 @@ class GradCache:
             assert scaler is not None, "fp16 requires a gradient scaler"
         self.scaler = scaler if mixed_precision == "fp16" else None
         self._get_input_tensors_strict = False
+        self.step = 0
+        self.clip_start_step = clip_start_step
+        self.rep_grad_clip = rep_grad_clip
 
     def __call__(self, *args, **kwargs):
         """
@@ -333,6 +343,42 @@ class GradCache:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+
+        grad_norms = []
+        grad_tensors = []
+        for r_tensor in reps:
+            g = r_tensor.grad
+            if g is not None:
+                grad_norms.append(g.norm().item())
+                grad_tensors.append(g)
+
+        if grad_norms:
+            grad_norms_tensor = torch.tensor(
+                grad_norms, device=loss.device
+            )  # Move to device for torch functions
+            median_grad_norm = torch.median(grad_norms_tensor).item()
+            mean_grad_norm = torch.mean(grad_norms_tensor).item()
+            max_grad_norm = torch.max(grad_norms_tensor).item()
+            logger.info(
+                f"Step {self.step}: Median norm of grad for reps: {median_grad_norm}"
+            )
+            logger.info(
+                f"Step {self.step}: Mean norm of grad for reps: {mean_grad_norm}"
+            )
+            logger.info(f"Step {self.step}: Max norm of grad for reps: {max_grad_norm}")
+            if wandb.run and self.step % 20 == 0:
+                wandb.log(
+                    {
+                        "grad_norm/median": median_grad_norm,
+                        "grad_norm/mean": mean_grad_norm,
+                        "grad_norm/max": max_grad_norm,
+                    }
+                )
+
+            if self.rep_grad_clip is not None and self.step >= self.clip_start_step:
+                torch.nn.utils.clip_grad_norm_(grad_tensors, self.rep_grad_clip)
+
+            self.step += 1
 
         cache = [r.grad for r in reps]
 
