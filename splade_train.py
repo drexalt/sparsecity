@@ -353,6 +353,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     splade_model,
                     optimizer,
                     global_step,
+                    use_distillation=cfg.use_distillation,
                     path=checkpoint_directory,
                 )
                 logger.error(
