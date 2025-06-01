@@ -3,6 +3,7 @@ from sparsecity.training.trainer import (
     train_step_kldiv_ibn,
     train_step_mse,
     train_step_kldiv_gradcache,
+    train_step_kldiv_NO_GC,
 )
 from datetime import datetime
 from collections import deque
@@ -52,6 +53,8 @@ class TrainingConfig:
     model: DictConfig
     sparse_embed: bool
     custom_kernel: bool
+    use_grad_cache: bool
+    accum_steps: int
     batch_size: int
     mini_batch: int
     num_negatives: int
@@ -276,6 +279,38 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         # scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
+    def maybe_optim_step(
+        step_in_epoch: int, accum_steps: int, dataloader_len: int
+    ) -> tuple[float | None, bool, bool]:
+        """Perform optimizer.step() every `accum_steps` micro-batches."""
+
+        if (
+            step_in_epoch + 1
+        ) % accum_steps != 0 and step_in_epoch + 1 != dataloader_len:
+            return None, False, False
+
+        # --- gradient clipping / explosion check happens **here** --------------
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(
+            splade_model.parameters(), float("inf")
+        )
+        grad_norm_val = total_grad_norm.item()
+
+        exploded = not torch.isfinite(total_grad_norm) or (
+            len(safe_grad_window) == safe_grad_window.maxlen
+            and grad_norm_val > 10 * max(safe_grad_window)
+        )
+        safe_grad_window.append(grad_norm_val)
+
+        if exploded:
+            optimizer.zero_grad(set_to_none=True)
+            return grad_norm_val, True, False
+
+        optimizer.step()
+        # scheduler.step()        # uncomment if you use one
+        optimizer.zero_grad(set_to_none=True)
+
+        return grad_norm_val, False, True
+
     global_step = 0
 
     # Grad Cache
@@ -312,14 +347,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             mse_weight = torch.tensor(0.05, device=device)
             temperature_ce = torch.tensor(1.0, device=device)
             temperature_kl = torch.tensor(1.0, device=device)
-            metrics = train_step_kldiv_gradcache(
-                gc,
+            loss_scale = torch.tensor(1.0 / cfg.accum_steps, device=device)
+
+            train_kwargs = dict(
                 model=splade_model,
                 query_input_ids=query_ids,
                 query_attention_mask=query_mask,
                 doc_input_ids=doc_ids,
                 doc_attention_mask=doc_mask,
-                # cfg.top_k,
                 lambda_t_d=torch.tensor(lambda_t_d, device=device),
                 lambda_t_q=torch.tensor(lambda_t_q, device=device),
                 temperature_ce=temperature_ce,
@@ -329,24 +364,23 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 mse_weight=mse_weight,
             )
 
-            # Gradient clipping: don't start clipping until after warmup
-            # if global_step > cfg.optimizer.grad_clip_warmup_steps:
-            #     total_grad_norm = torch.nn.utils.clip_grad_norm_(
-            #         splade_model.parameters(), max_norm=cfg.optimizer.max_grad_norm
-            #     )
-            # else:
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                splade_model.parameters(), max_norm=float("inf")
+            if cfg.use_grad_cache:
+                metrics = train_step_kldiv_gradcache(
+                    gc,
+                    **train_kwargs,
+                )
+            else:
+                metrics = train_step_kldiv_NO_GC(
+                    **train_kwargs,
+                    loss_scale=loss_scale,
+                )
+
+            grad_norm_val, exploded, stepped = maybe_optim_step(
+                step_in_epoch=step,
+                accum_steps=cfg.accum_steps,
+                dataloader_len=len(dataloader),
             )
 
-            total_grad_norm_val = total_grad_norm.item()
-
-            exploded = not torch.isfinite(total_grad_norm) or (
-                len(safe_grad_window) == safe_grad_window.maxlen
-                and total_grad_norm_val > 10 * max(safe_grad_window)
-            )
-
-            safe_grad_window.append(total_grad_norm_val)
             if exploded:
                 dump_debug_bundle(
                     batch,
@@ -359,88 +393,78 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 logger.error(
                     f"Gradient explosion at step {global_step}. Skipping batch. Batch logged to {checkpoint_directory}/debug_step_{global_step}.pt"
                 )
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 continue
 
-            optimized_step()
-            metrics = {
-                "loss/total_loss": metrics["total_loss"].item(),
-                "loss/triplet_loss": metrics["triplet_loss"].item(),
-                "loss/kl_loss": metrics["kl_loss"].item(),
-                "loss/flops": metrics["flops_loss"].item(),
-                "loss/anti_zero": metrics["anti_zero_loss"].item(),
-                "loss/mse": metrics["mse_loss"].item(),
-                "metrics/query_min_non_zero": metrics["query_min_non_zero"].item(),
-                "metrics/doc_min_non_zero": metrics["doc_min_non_zero"].item(),
-                "metrics/avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
-                "metrics/avg_doc_non_zero_count": metrics["avg_doc_non_zero_count"],
-                "metrics/query_median_non_zero": metrics[
-                    "query_median_non_zero"
-                ].item(),
-                "metrics/doc_median_non_zero": metrics["doc_median_non_zero"].item(),
-                "metrics/total_grad_norm": total_grad_norm.item(),
-            }
+            if stepped:
+                global_step += 1
 
-            # metrics["metrics/kl_temp"] = splade_model.temperature_kl.detach().item()
-            # metrics["metrics/ce_temp"] = splade_model.temperature_ce.detach().item()
+                metrics = {
+                    "loss/total_loss": metrics["total_loss"].item(),
+                    "loss/triplet_loss": metrics["triplet_loss"].item(),
+                    "loss/kl_loss": metrics["kl_loss"].item(),
+                    "loss/flops": metrics["flops_loss"].item(),
+                    "loss/anti_zero": metrics["anti_zero_loss"].item(),
+                    "loss/mse": metrics["mse_loss"].item(),
+                    "metrics/query_min_non_zero": metrics["query_min_non_zero"].item(),
+                    "metrics/doc_min_non_zero": metrics["doc_min_non_zero"].item(),
+                    "metrics/avg_query_non_zero_count": metrics[
+                        "avg_query_non_zero_count"
+                    ],
+                    "metrics/avg_doc_non_zero_count": metrics["avg_doc_non_zero_count"],
+                    "metrics/query_median_non_zero": metrics[
+                        "query_median_non_zero"
+                    ].item(),
+                    "metrics/doc_median_non_zero": metrics[
+                        "doc_median_non_zero"
+                    ].item(),
+                    "metrics/total_grad_norm": grad_norm_val,
+                }
 
-            # For SparseEmbed models - will clean eventually when I adapt SparseEmbed for KLDiv
-            # metrics = {
-            #     "total_loss": metrics["total_loss"].item(),
-            #     "triplet_loss": metrics["triplet_loss"].item(),
-            #     "dense_loss": metrics["dense_loss"].item(),
-            #     "sparse_mse_loss": metrics["sparse_mse_loss"].item(),
-            #     "dense_mse_loss": metrics["dense_mse_loss"].item(),
-            #     "flops_loss": metrics["flops_loss"].item(),
-            #     "anti_zero_loss": metrics["anti_zero_loss"].item(),
-            #     "query_sparsity": metrics["query_sparsity"].item(),
-            #     "doc_sparsity": metrics["doc_sparsity"].item(),
-            #     "avg_query_non_zero_count": metrics["avg_query_non_zero_count"],
-            # }
-            if cfg.wandb and step % cfg.log_every == 0:
-                wandb.log({**metrics}, step=global_step)
+                if cfg.wandb and step % cfg.log_every == 0:
+                    wandb.log({**metrics}, step=global_step)
 
-            if (step + 1) % cfg.evaluation.eval_every_steps == 0 or global_step == 50:
-                splade_model.eval()
-                optimizer.eval()
-                val_results = validate_model(
-                    evaluator,
-                    splade_model,
-                    tokenizer,
-                    device,
-                    sparse_embed=cfg.sparse_embed,
-                    top_k=cfg.top_k,
-                )
-                splade_model.train()
-
-                if cfg.wandb:
-                    # Flatten results for wandb logging
-                    wandb.log(
-                        {
-                            "validation/ndcg@10": val_results["ndcg@10"],
-                            "validation/mrr@10": val_results["mrr@10"],
-                            "validation/map@100": val_results["map@100"],
-                            **{
-                                f"validation/supplementary/{k}": v
-                                for k, v in val_results.items()
-                                if k not in ["ndcg@10", "mrr@10", "map@100"]
-                            },
-                        },
-                        step=global_step,
+                if (
+                    global_step + 1
+                ) % cfg.evaluation.eval_every_steps == 0 or global_step == 50:
+                    splade_model.eval()
+                    optimizer.eval()
+                    val_results = validate_model(
+                        evaluator,
+                        splade_model,
+                        tokenizer,
+                        device,
+                        sparse_embed=cfg.sparse_embed,
+                        top_k=cfg.top_k,
                     )
+                    splade_model.train()
 
-                # Save checkpoint
-                checkpoint_scores = update_checkpoint_tracking(
-                    step=global_step,
-                    score=val_results["msmarco_mrr@10"],
-                    checkpoint_scores=checkpoint_scores,
-                    max_checkpoints=cfg.checkpoint.max_to_keep,
-                    splade_model=splade_model,
-                    optimizer=optimizer,
-                    checkpoint_path=checkpoint_directory,
-                )
-            global_step += 1
+                    if cfg.wandb:
+                        # Flatten results for wandb logging
+                        wandb.log(
+                            {
+                                "validation/ndcg@10": val_results["ndcg@10"],
+                                "validation/mrr@10": val_results["mrr@10"],
+                                "validation/map@100": val_results["map@100"],
+                                **{
+                                    f"validation/supplementary/{k}": v
+                                    for k, v in val_results.items()
+                                    if k not in ["ndcg@10", "mrr@10", "map@100"]
+                                },
+                            },
+                            step=global_step,
+                        )
+
+                    # Save checkpoint
+                    checkpoint_scores = update_checkpoint_tracking(
+                        step=global_step,
+                        score=val_results["msmarco_mrr@10"],
+                        checkpoint_scores=checkpoint_scores,
+                        max_checkpoints=cfg.checkpoint.max_to_keep,
+                        splade_model=splade_model,
+                        optimizer=optimizer,
+                        checkpoint_path=checkpoint_directory,
+                    )
+                global_step += 1
 
 
 @hydra.main(config_path="conf", config_name="cocondenser_base", version_base=None)

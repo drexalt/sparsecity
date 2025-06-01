@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from .grad_cache import gc_backward_and_zero_grad, RandContext, GradCache
+from .losses import contrastive_kd_loss, contrastive_kd_loss_with_hard_negatives
 
 
 # @torch.compile(mode="default")
@@ -638,4 +639,59 @@ def train_step_kldiv_gradcache(
 
     metrics.update({k: v.detach() for k, v in loss_parts.items()})
 
+    return metrics
+
+
+def train_step_kldiv_NO_GC(
+    model: nn.Module,
+    query_input_ids: Tensor,
+    query_attention_mask: Tensor,
+    doc_input_ids: Tensor,
+    doc_attention_mask: Tensor,
+    lambda_t_d: Tensor,
+    lambda_t_q: Tensor,
+    temperature_ce: Tensor,
+    temperature_kl: Tensor,
+    loss_scale: Tensor,
+    *,
+    n_ways: int | None = 32,
+    teacher_scores: Optional[Tensor] = None,
+    mse_weight: Optional[Tensor] = None,
+) -> Dict[str, Tensor]:
+    model.train()  # ensure dropout etc. are on
+    B, n_docs_per_query, Ld = doc_input_ids.shape
+
+    # ---------------- Query representations ----------------------------------
+    q_rep: Tensor = model(  # [B, D]
+        input_ids=query_input_ids,
+        attention_mask=query_attention_mask,
+    )
+
+    # --------------- Document representations --------------------------------
+    doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
+    doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
+    d_rep_flat: Tensor = model(  # [(B*n_docs), D]
+        input_ids=doc_input_ids_flat,
+        attention_mask=doc_attention_flat,
+    )
+
+    # ---------------- Loss & metrics -----------------------------------------
+    total_loss, loss_parts = contrastive_kd_loss_with_hard_negatives(
+        q_rep=q_rep,
+        d_rep_flat=d_rep_flat,
+        n_docs_per_query=n_docs_per_query,
+        lambda_t_d=lambda_t_d,
+        lambda_t_q=lambda_t_q,
+        temperature_ce=temperature_ce,
+        temperature_kl=temperature_kl,
+        n_ways=n_ways,
+        teacher_scores=teacher_scores,
+        mse_weight=mse_weight,
+    )
+    # ---------------- Back-prop ---------------------------------------------
+    (total_loss * loss_scale).backward()
+
+    # --------------- Return detached metrics ---------------------------------
+    metrics: Dict[str, Tensor] = {"total_loss": total_loss.detach()}
+    metrics.update({k: v.detach() for k, v in loss_parts.items()})
     return metrics
