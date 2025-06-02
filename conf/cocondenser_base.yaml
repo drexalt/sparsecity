@@ -10,7 +10,8 @@ data:
 
 use_distillation: True
 custom_kernel: True
-use_grad_cache: False
+use_grad_cache: True
+bf16: True
 accum_steps: 8
 batch_size: 4
 mini_batch: 64
@@ -21,8 +22,8 @@ proximity_threshold: 0.05
 max_length: 256
 lambda_d: 0.01
 lambda_q: 0.01
-T_d: 6000
-T_q: 6000
+T_d: 2000
+T_q: 2000
 T_d_start: 0
 T_q_start: 0
 top_k: null
@@ -42,7 +43,7 @@ checkpoint:
   save_interval_steps: 800
   checkpoint_path: "checkpoints/cocondenser"
 evaluation:
-  eval_every_steps: 1200
+  eval_every_steps: 300
   datasets: ["scifact", "quoraretrieval", "msmarco", "touche2020", "scidocs", "nfcorpus"]
   batch_size: 16
 wandb: True

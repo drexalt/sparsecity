@@ -4,8 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from .grad_cache import gc_backward_and_zero_grad, RandContext, GradCache
+from .grad_cache import (
+    gc_backward_and_zero_grad,
+    RandContext,
+    GradCache,
+    log_rep_grad_norms,
+)
 from .losses import contrastive_kd_loss, contrastive_kd_loss_with_hard_negatives
+from contextlib import nullcontext
 
 
 # @torch.compile(mode="default")
@@ -657,28 +663,43 @@ def train_step_kldiv_NO_GC(
     n_ways: int | None = 32,
     teacher_scores: Optional[Tensor] = None,
     mse_weight: Optional[Tensor] = None,
+    rep_grad_clip: Optional[Tensor] = None,
+    step: int,
+    clip_start_step: int,
+    bf16: bool = False,
 ) -> Dict[str, Tensor]:
     model.train()  # ensure dropout etc. are on
     B, n_docs_per_query, Ld = doc_input_ids.shape
 
     # ---------------- Query representations ----------------------------------
-    q_rep: Tensor = model(  # [B, D]
-        input_ids=query_input_ids,
-        attention_mask=query_attention_mask,
-    )
-
-    # --------------- Document representations --------------------------------
     doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
     doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
-    d_rep_flat: Tensor = model(  # [(B*n_docs), D]
-        input_ids=doc_input_ids_flat,
-        attention_mask=doc_attention_flat,
-    )
+    with (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if bf16
+        else nullcontext()
+    ):
+        q_rep: Tensor = model(  # [B, D]
+            input_ids=query_input_ids,
+            attention_mask=query_attention_mask,
+        )
+        d_rep_flat: Tensor = model(  # [(B*n_docs), D]
+            input_ids=doc_input_ids_flat,
+            attention_mask=doc_attention_flat,
+        )
+
+    # --------------- Document representations --------------------------------
+
+    if bf16:
+        q_rep = q_rep.float()
+        d_rep_flat = d_rep_flat.float()
+    q_rep_detached = q_rep.detach().requires_grad_()
+    d_rep_flat_detached = d_rep_flat.detach().requires_grad_()
 
     # ---------------- Loss & metrics -----------------------------------------
     total_loss, loss_parts = contrastive_kd_loss_with_hard_negatives(
-        q_rep=q_rep,
-        d_rep_flat=d_rep_flat,
+        q_rep=q_rep_detached,
+        d_rep_flat=d_rep_flat_detached,
         n_docs_per_query=n_docs_per_query,
         lambda_t_d=lambda_t_d,
         lambda_t_q=lambda_t_q,
@@ -689,9 +710,23 @@ def train_step_kldiv_NO_GC(
         mse_weight=mse_weight,
     )
     # ---------------- Back-prop ---------------------------------------------
-    (total_loss * loss_scale).backward()
+    scaled_loss = total_loss * loss_scale
+    scaled_loss.backward()  # Since reps are detached, doesn't flow to model params
+
+    q_grad_norm = q_rep_detached.grad.norm().item()
+    d_grad_norm = d_rep_flat_detached.grad.norm().item()
+
+    if rep_grad_clip is not None and step >= clip_start_step:
+        torch.nn.utils.clip_grad_norm_(
+            [q_rep_detached, d_rep_flat_detached], rep_grad_clip
+        )
+
+    q_rep.backward(q_rep_detached.grad)
+    d_rep_flat.backward(d_rep_flat_detached.grad)
 
     # --------------- Return detached metrics ---------------------------------
     metrics: Dict[str, Tensor] = {"total_loss": total_loss.detach()}
     metrics.update({k: v.detach() for k, v in loss_parts.items()})
+    metrics["q_grad_norm"] = q_grad_norm
+    metrics["d_grad_norm"] = d_grad_norm
     return metrics

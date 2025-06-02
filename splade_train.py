@@ -54,6 +54,7 @@ class TrainingConfig:
     sparse_embed: bool
     custom_kernel: bool
     use_grad_cache: bool
+    bf16: bool
     accum_steps: int
     batch_size: int
     mini_batch: int
@@ -324,7 +325,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         models=[splade_model, splade_model],
         chunk_sizes=cfg.mini_batch,
         loss_fn=contrastive_kd_loss_with_hard_negatives,
-        mixed_precision="bf16",
+        mixed_precision="bf16" if cfg.bf16 else "fp32",
         rep_grad_clip=cfg.optimizer.rep_grad_clip,
         clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
     )
@@ -380,6 +381,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 metrics = train_step_kldiv_NO_GC(
                     **train_kwargs,
                     loss_scale=loss_scale,
+                    rep_grad_clip=torch.tensor(
+                        cfg.optimizer.rep_grad_clip, device=device
+                    ),
+                    step=global_step,
+                    clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
+                    bf16=cfg.bf16,
                 )
 
             grad_norm_val, exploded, stepped = maybe_optim_step(
@@ -403,7 +410,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 )
                 continue
 
-            metrics = {
+            log_metrics = {
                 "loss/total_loss": metrics["total_loss"].item(),
                 "loss/triplet_loss": metrics["triplet_loss"].item(),
                 "loss/kl_loss": metrics["kl_loss"].item(),
@@ -421,8 +428,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 "metrics/total_grad_norm": grad_norm_val,
             }
 
+            # Non-Grad-Cache case
+            if metrics["q_grad_norm"] is not None:
+                log_metrics["metrics/q_grad_norm"] = metrics["q_grad_norm"]
+            if metrics["d_grad_norm"] is not None:
+                log_metrics["metrics/d_grad_norm"] = metrics["d_grad_norm"]
+
             if cfg.wandb and global_step % LOG_EVERY_MICRO == 0:
-                wandb.log({**metrics}, step=global_step // accum_steps)
+                wandb.log({**log_metrics}, step=global_step // accum_steps)
 
             if (global_step + 1) % EVAL_EVERY_MICRO == 0 or global_step == 50:
                 splade_model.eval()
@@ -450,7 +463,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                                 if k not in ["ndcg@10", "mrr@10", "map@100"]
                             },
                         },
-                        step=global_step,
+                        step=global_step // accum_steps,
                     )
 
                 # Save checkpoint

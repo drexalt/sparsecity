@@ -100,6 +100,55 @@ def gc_backward_and_zero_grad(
         #         break
 
 
+def log_rep_grad_norms(
+    reps: list[Tensor],
+    step: int,
+    *,
+    rep_grad_clip: float | None = None,
+    clip_start_step: int = 0,
+):
+    """
+    Compute median / mean / max grad-norm of the given representation tensors,
+    log to python logger and (optionally) to wandb, and apply gradient clipping.
+
+    Parameters
+    ----------
+    reps : list[Tensor]
+        Each tensor must have `.grad` populated (call `.retain_grad()` first).
+    step : int
+        Global optimiser step, used only for logging messages.
+    rep_grad_clip : float | None
+        If given, clip each rep tensor to this max-norm (identical to GradCache).
+    clip_start_step : int
+        Do not clip before this step (warm-up).
+    """
+    grad_tensors = [r.grad for r in reps if r.grad is not None]
+    if not grad_tensors:
+        return  # nothing to report
+
+    norms = torch.tensor(
+        [g.norm() for g in grad_tensors], device=grad_tensors[0].device
+    )
+    median, mean, max_ = norms.median().item(), norms.mean().item(), norms.max().item()
+
+    logger.info(
+        f"Step {step}: rep-grad median {median:.4g} / mean {mean:.4g} / max {max_:.4g}"
+    )
+
+    if wandb.run and step % 20 == 0:
+        wandb.log(
+            {
+                "grad_norm/median": median,
+                "grad_norm/mean": mean,
+                "grad_norm/max": max_,
+            },
+            step=step,
+        )
+
+    if rep_grad_clip is not None and step >= clip_start_step:
+        torch.nn.utils.clip_grad_norm_(grad_tensors, rep_grad_clip)
+
+
 class GradCache:
     """
     Gradient Cache class. Implements input chunking, first graph-less forward pass, Gradient Cache creation, second
@@ -376,7 +425,7 @@ class GradCache:
                 )
 
             if self.rep_grad_clip is not None and self.step >= self.clip_start_step:
-                torch.nn.utils.clip_grad_norm_(grad_tensors, self.rep_grad_clip)
+                torch.nn.utils.clip_grad_norm_(reps, self.rep_grad_clip)
 
             self.step += 1
 
