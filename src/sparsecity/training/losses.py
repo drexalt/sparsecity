@@ -350,13 +350,14 @@ def contrastive_kd_loss_with_hard_negatives(
     hard_neg_cols = torch.cat(hard_neg_indices, dim=0).view(
         B, n_docs_per_query - 1
     )  # [B, n_docs_per_query-1]
-
+    is_positive = torch.zeros(B * n_docs_per_query, dtype=torch.bool, device=device)
+    is_positive[pos_idx_flat] = True
     # Identify in-batch negative indices (excluding query's own documents)
     owner = (
         torch.arange(B * n_docs_per_query, device=device) // n_docs_per_query
     )  # [B*n_docs]
-    neg_mask = owner.unsqueeze(0) != torch.arange(B, device=device).unsqueeze(
-        1
+    neg_mask = (
+        owner.unsqueeze(0) != torch.arange(B, device=device).unsqueeze(1) & ~is_positive
     )  # [B, B*n_docs]
     all_cols = torch.arange(B * n_docs_per_query, device=device).expand(
         B, -1
