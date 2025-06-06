@@ -4,6 +4,7 @@ import ast
 import datasets
 import logging
 import random
+from plsfix import fix_text
 
 logger = logging.getLogger(__name__)
 
@@ -184,14 +185,16 @@ class KDProcessing:
 
         processed_example = {
             "scores": example["scores"],
-            "query": self.queries[self.queries_index[example["query_id"]]]["text"],
+            "query": fix_text(
+                self.queries[self.queries_index[example["query_id"]]]["text"]
+            ),
         }
 
         documents = []
         for document_id in example["document_ids"]:
             try:
                 documents.append(
-                    self.documents[self.documents_index[document_id]]["text"]
+                    fix_text(self.documents[self.documents_index[document_id]]["text"])
                 )
             except KeyError:
                 documents.append("")
