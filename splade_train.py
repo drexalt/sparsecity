@@ -140,18 +140,13 @@ def compute_lambda_t(lambda_val: float, step_ratio: float) -> float:
     return min(lambda_val, lambda_val * (step_ratio**2))
 
 
-def compute_lambda_t_delayed(
-    lambda_val: float,
-    global_step: int,
-    start_step: int,
-    end_step: int,  # T_d or T_q
+def compute_lambda_exact(
+    lambda_max: float, global_step: int, warmup_steps: int, min_lambda: float = 0.0
 ) -> float:
-    if global_step < start_step:
-        return 0.0
-
-    # progress ∈ (0, 1] during the ramp
-    progress = (global_step - start_step + 1) / (end_step - start_step + 1)
-    return min(lambda_val, lambda_val * (progress**2))
+    if global_step >= warmup_steps:
+        return lambda_max
+    ratio = global_step / warmup_steps
+    return (lambda_max - min_lambda) * (ratio**2) + min_lambda
 
 
 def train_model(splade_model, tokenizer, cfg, dataset):
@@ -183,33 +178,33 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             {"params": other_params, "lr": cfg.optimizer.learning_rate},
         ]
 
-    # warmup_steps = cfg.optimizer.warmup_steps
+    warmup_steps = cfg.optimizer.warmup_steps
 
-    # def lambda_lr(step):
-    #     if warmup_steps == 0:
-    #         return 1.0
-    #     return min(1, step / warmup_steps)
+    def lambda_lr(step):
+        if warmup_steps == 0:
+            return 1.0
+        return min(1, step / warmup_steps)
 
-    # optimizer = torch.optim.AdamW(
-    #     optim_param_groups
-    #     if cfg.init_ce_temp is not None
-    #     else splade_model.parameters(),
-    #     lr=cfg.optimizer.learning_rate,
-    #     weight_decay=cfg.optimizer.weight_decay,
-    # )
-
-    # scheduler = torch.optim.lr_scheduler.LambdaLR(
-    #     optimizer,
-    #     lambda_lr,
-    # )
-
-    optimizer = AdamWScheduleFree(
+    optimizer = torch.optim.AdamW(
         optim_param_groups
         if cfg.init_ce_temp is not None
         else splade_model.parameters(),
-        warmup_steps=cfg.optimizer.warmup_steps,
+        lr=cfg.optimizer.learning_rate,
         weight_decay=cfg.optimizer.weight_decay,
     )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda_lr,
+    )
+
+    # optimizer = AdamWScheduleFree(
+    #     optim_param_groups
+    #     if cfg.init_ce_temp is not None
+    #     else splade_model.parameters(),
+    #     warmup_steps=cfg.optimizer.warmup_steps,
+    #     weight_decay=cfg.optimizer.weight_decay,
+    # )
 
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
@@ -310,7 +305,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             return grad_norm_val, True, False
 
         optimizer.step()
-        # scheduler.step()        # uncomment if you use one
+        scheduler.step()  # uncomment if you use one
         optimizer.zero_grad(set_to_none=True)
 
         return grad_norm_val, False, True
@@ -343,14 +338,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             else:
                 query_ids, query_mask, doc_ids, doc_mask = (t.to(device) for t in batch)
 
-            lambda_t_d = compute_lambda_t_delayed(
-                cfg.lambda_d, global_step // accum_steps, cfg.T_d_start, cfg.T_d
+            lambda_t_d = compute_lambda_exact(
+                cfg.lambda_d, global_step // accum_steps, cfg.T_d
             )
-            lambda_t_q = compute_lambda_t_delayed(
-                cfg.lambda_q, global_step // accum_steps, cfg.T_q_start, cfg.T_q
+            lambda_t_q = compute_lambda_exact(
+                cfg.lambda_q, global_step // accum_steps, cfg.T_q
             )
 
-            optimizer.train()
+            # optimizer.train()
 
             mse_weight = torch.tensor(0.05, device=device)
             temperature_ce = torch.tensor(1.0, device=device)
@@ -372,6 +367,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 mse_weight=mse_weight,
             )
 
+            rep_grad_clip = (
+                torch.tensor(cfg.optimizer.rep_grad_clip, device=device)
+                if cfg.optimizer.rep_grad_clip
+                else None
+            )
+
             if cfg.use_grad_cache:
                 metrics = train_step_kldiv_gradcache(
                     gc,
@@ -381,9 +382,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 metrics = train_step_kldiv_NO_GC(
                     **train_kwargs,
                     loss_scale=loss_scale,
-                    rep_grad_clip=torch.tensor(
-                        cfg.optimizer.rep_grad_clip, device=device
-                    ),
+                    rep_grad_clip=rep_grad_clip,
                     step=global_step,
                     clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
                     bf16=cfg.bf16,
@@ -439,7 +438,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             if (global_step + 1) % EVAL_EVERY_MICRO == 0 or global_step == 50:
                 splade_model.eval()
-                optimizer.eval()
+                # optimizer.eval()
                 val_results = validate_model(
                     evaluator,
                     splade_model,
