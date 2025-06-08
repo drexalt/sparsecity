@@ -1,0 +1,53 @@
+defaults:
+  - _self_
+  - model: nomic
+
+seed: 1776
+
+data:
+  name: "jturner116/msmarco-hard-negatives-scored-stella"
+  split: "train"
+
+use_distillation: True
+custom_kernel: True
+use_grad_cache: False
+bf16: True
+accum_steps: 4
+batch_size: 8
+mini_batch: 64
+num_negatives: 32
+sample_size: 8
+n_ways: 16
+proximity_threshold: 0.05
+max_length: 256
+lambda_d: 5.0e-4
+lambda_q: 5.0e-4
+T_d: 50000
+T_q: 50000
+T_d_start: 0
+T_q_start: 0
+top_k: null
+epochs: 20
+sparse_embed: False
+init_ce_temp: null
+init_kl_temp: null
+optimizer:
+  learning_rate: 3e-5
+  warmup_steps: 5000
+  grad_clip_warmup_steps: 6000
+  weight_decay: 0.00
+  max_grad_norm: null
+  rep_grad_clip: null
+checkpoint:
+  max_to_keep: 3
+  save_interval_steps: 800
+  checkpoint_path: "checkpoints/nomic"
+evaluation:
+  eval_every_steps: 2000
+  datasets: ["scifact", "quoraretrieval", "msmarco", "touche2020", "scidocs", "nfcorpus"]
+  batch_size: 16
+wandb: True
+wandb_project: "splade-nomic"
+log_every: 20
+
+

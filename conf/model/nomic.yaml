@@ -1,0 +1,4 @@
+name: "nomic-ai/nomic-bert-2048"
+family: "nomic"
+from_pt: False
+checkpoint_path: null
