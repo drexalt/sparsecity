@@ -99,7 +99,7 @@ def save_checkpoint(
         "ndcg@10": score,
     }
     filepath = os.path.join(
-        checkpoint_path, f"checkpoint_step_{step}_ndcg_{score:.4f}.pt"
+        checkpoint_path, f"checkpoint_step_{step}_msmarco_mrr@10_{score:.4f}.pt"
     )
     torch.save(checkpoint, filepath)
     return filepath
@@ -204,6 +204,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     #     else splade_model.parameters(),
     #     warmup_steps=cfg.optimizer.warmup_steps,
     #     weight_decay=cfg.optimizer.weight_decay,
+    #     betas=(0.98, 0.999),
     # )
 
     if cfg.max_length is not None:
@@ -481,7 +482,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
     config = AutoConfig.from_pretrained(cfg.model.name)
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
     model = get_splade_model(
         cfg.model.name,
         config=config,
