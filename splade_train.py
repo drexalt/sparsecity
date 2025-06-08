@@ -481,7 +481,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 @hydra.main(config_path="conf", config_name="cocondenser_base", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
-    config = AutoConfig.from_pretrained(cfg.model.name)
+    config = AutoConfig.from_pretrained(cfg.model.name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
     model = get_splade_model(
         cfg.model.name,
