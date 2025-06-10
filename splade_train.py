@@ -20,7 +20,13 @@ from sparsecity.training.losses import (
     contrastive_kd_loss,
     contrastive_kd_loss_with_hard_negatives,
 )
-from sparsecity.utils.utils import flatten_dict, dump_debug_bundle
+from sparsecity.utils.utils import (
+    flatten_dict,
+    dump_debug_bundle,
+    compute_top_k,
+    compute_lambda_exact,
+    update_checkpoint_tracking,
+)
 from sparsecity.evaluation.validate import validate_model
 from sentence_transformers.evaluation import NanoBEIREvaluator
 from sentence_transformers.similarity_functions import dot_score
@@ -67,9 +73,10 @@ class TrainingConfig:
     lambda_q: float
     T_d: float
     T_q: float
-    T_d_start: int
-    T_q_start: int
     top_k: int
+    schedule_top_k: bool
+    initial_top_k: int
+    top_k_warmup_steps: int
     epochs: int
     init_ce_temp: float
     init_kl_temp: float
@@ -83,70 +90,6 @@ class TrainingConfig:
 
 
 logger = logging.getLogger(__name__)
-
-
-def save_checkpoint(
-    step: int,
-    score: float,
-    splade_model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    checkpoint_path: str,
-) -> str:
-    checkpoint = {
-        "splade_model": splade_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "step": step,
-        "ndcg@10": score,
-    }
-    filepath = os.path.join(
-        checkpoint_path, f"checkpoint_step_{step}_msmarco_mrr@10_{score:.4f}.pt"
-    )
-    torch.save(checkpoint, filepath)
-    return filepath
-
-
-def update_checkpoint_tracking(
-    step: int,
-    score: float,
-    checkpoint_scores: list,
-    max_checkpoints: int,
-    splade_model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    checkpoint_path: str,
-) -> list:
-    # Create a new list to maintain purity
-    updated_checkpoint_scores = checkpoint_scores.copy()
-
-    if len(updated_checkpoint_scores) < max_checkpoints:
-        filepath = save_checkpoint(
-            step, score, splade_model, optimizer, checkpoint_path
-        )
-        heappush(updated_checkpoint_scores, (score, step, filepath))
-    elif score > updated_checkpoint_scores[0][0]:  # Compare with lowest score
-        # Remove lowest scoring checkpoint
-        _, old_step, old_filepath = heappop(updated_checkpoint_scores)
-        if os.path.exists(old_filepath):
-            os.remove(old_filepath)
-        # Save new checkpoint
-        filepath = save_checkpoint(
-            step, score, splade_model, optimizer, checkpoint_path
-        )
-        heappush(updated_checkpoint_scores, (score, step, filepath))
-
-    return updated_checkpoint_scores
-
-
-def compute_lambda_t(lambda_val: float, step_ratio: float) -> float:
-    return min(lambda_val, lambda_val * (step_ratio**2))
-
-
-def compute_lambda_exact(
-    lambda_max: float, global_step: int, warmup_steps: int, min_lambda: float = 0.0
-) -> float:
-    if global_step >= warmup_steps:
-        return lambda_max
-    ratio = global_step / warmup_steps
-    return (lambda_max - min_lambda) * (ratio**2) + min_lambda
 
 
 def train_model(splade_model, tokenizer, cfg, dataset):
@@ -332,6 +275,17 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     for epoch in range(cfg.epochs):
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             global_step += 1
+
+            # Top-k scheduling
+            if cfg.schedule_top_k:
+                current_top_k = compute_top_k(
+                    initial_top_k=cfg.initial_top_k,
+                    final_top_k=cfg.top_k,
+                    global_step=global_step // accum_steps,
+                    warmup_steps=cfg.top_k_warmup_steps,
+                )
+                splade_model.top_k = current_top_k
+
             if cfg.use_distillation:
                 query_ids, query_mask, doc_ids, doc_mask, teacher_scores = (
                     t.to(device) for t in batch

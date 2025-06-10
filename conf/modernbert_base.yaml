@@ -24,9 +24,11 @@ lambda_d: 5.0e-4
 lambda_q: 5.0e-4
 T_d: 50000
 T_q: 50000
-T_d_start: 0
-T_q_start: 0
-top_k: null
+# Top-k scheduling
+top_k: 200
+schedule_top_k: True
+initial_top_k: 50000
+top_k_warmup_steps: 40000
 epochs: 20
 sparse_embed: False
 init_ce_temp: null

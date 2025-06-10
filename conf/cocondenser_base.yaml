@@ -12,11 +12,11 @@ use_distillation: True
 custom_kernel: True
 use_grad_cache: False
 bf16: True
-accum_steps: 1
-batch_size: 32
+accum_steps: 4
+batch_size: 8
 mini_batch: 64
 num_negatives: 32
-sample_size: 1
+sample_size: 8
 n_ways: 16
 proximity_threshold: 0.05
 max_length: 256
@@ -24,8 +24,6 @@ lambda_d: 1.0e-4
 lambda_q: 3.0e-4
 T_d: 50000
 T_q: 50000
-T_d_start: 0
-T_q_start: 0
 top_k: null
 epochs: 20
 sparse_embed: False
