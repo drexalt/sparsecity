@@ -149,9 +149,13 @@ def kl_divergence_distillation_normalized(
     student_row_logits = torch.einsum(
         "bv,bnv->bn", student_query_norm, student_doc_norm
     )
-    student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
+    print(f"student_row_logits[0]: {student_row_logits[0].cpu().detach()}")
+    print(f"teacher_scores[0]: {teacher_scores[0].cpu().detach()}")
 
+    student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
+    print(f"student_log_softmax[0]: {student_log_softmax[0].cpu().detach()}")
     teacher_probs = F.softmax(teacher_scores / temperature_kl, dim=-1)
+    print(f"teacher_probs[0]: {teacher_probs[0].cpu().detach()}")
 
     return F.kl_div(student_log_softmax, teacher_probs, reduction="batchmean")
 
@@ -192,6 +196,7 @@ def contrastive_kd_loss(
     n_ways: Optional[int] = 32,
     teacher_scores: Optional[Tensor] = None,  # [B, n_docs]
     mse_weight: Optional[Tensor] = None,
+    kl_weight: Optional[Tensor] = None,
 ) -> Tensor:
     """Combined CE‑based contrastive loss + regularisation + KD."""
 
@@ -254,27 +259,27 @@ def contrastive_kd_loss(
     mse_loss = q_rep.new_tensor(0.0)
 
     if teacher_scores is not None:
-        kl_loss = kl_divergence_distillation(
+        kl_loss = kl_divergence_distillation_normalized(
             student_query_embeddings=q_rep,
             student_doc_embeddings=d_rep,
             teacher_scores=teacher_scores,
             temperature_kl=temperature_kl,
             device=device,
         )
+        if kl_weight is not None:
+            kl_loss = kl_loss * kl_weight
 
         # Student logits against its own docs (shape [B, n_docs])
         student_logits = (q_rep.float().unsqueeze(1) * d_rep.float()).sum(-1)
 
-        mse_raw = calculate_margin_mse_distillation(
+        mse_loss = calculate_margin_mse_distillation(
             student_scores_per_item=student_logits,
             teacher_scores_per_item=teacher_scores,
             temperature=temperature_kl,
             device=device,
         )
         if mse_weight is not None:
-            mse_loss = mse_raw * mse_weight
-        else:
-            mse_loss = mse_raw
+            mse_loss = mse_loss * mse_weight
 
     # --- Diagnostic sparsity / magnitude metrics -----------------------------
     q_abs = q_rep.abs()
@@ -344,6 +349,7 @@ def contrastive_kd_loss_with_hard_negatives(
     n_ways: Optional[int] = 32,  # Total number of ways (positive + negatives)
     teacher_scores: Optional[Tensor] = None,  # [B, n_docs]
     mse_weight: Optional[Tensor] = None,
+    kl_weight: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Combined CE-based contrastive loss + regularization + KD with hard negatives from triplet."""
 
@@ -458,20 +464,20 @@ def contrastive_kd_loss_with_hard_negatives(
             temperature_kl=temperature_kl,
             device=device,
         )
+        if kl_weight is not None:
+            kl_loss = kl_loss * kl_weight
 
         # Student logits against its own docs (shape [B, n_docs])
         student_logits = (q_rep.float().unsqueeze(1) * d_rep.float()).sum(-1)
 
-        mse_raw = calculate_margin_mse_distillation(
+        mse_loss = calculate_margin_mse_distillation(
             student_scores_per_item=student_logits,
             teacher_scores_per_item=teacher_scores,
             temperature=temperature_kl,
             device=device,
         )
         if mse_weight is not None:
-            mse_loss = mse_raw * mse_weight
-        else:
-            mse_loss = mse_raw
+            mse_loss = mse_loss * mse_weight
 
     # --- Diagnostic sparsity / magnitude metrics -----------------------------
     q_abs = q_rep.abs()
