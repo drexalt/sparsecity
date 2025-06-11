@@ -109,7 +109,7 @@ def calculate_anti_zero_loss(
     return torch.clamp(q_sum_sq_inv + d_sum_sq_inv, max=1.0)
 
 
-def calculate_kl_divergence_distillation(
+def kl_divergence_distillation(
     student_query_embeddings: torch.Tensor,  # [B, V]
     student_doc_embeddings: torch.Tensor,  # [B, N, V] (docs corresponding to each query)
     teacher_scores: torch.Tensor,  # [B, N] (teacher's scores for q_i vs d_i_j)
@@ -124,11 +124,36 @@ def calculate_kl_divergence_distillation(
     student_row_logits = torch.einsum(
         "bv,bnv->bn", student_query_embeddings, student_doc_embeddings
     )
-
     student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
-    teacher_log_softmax = F.softmax(teacher_scores / temperature_kl, dim=-1)
 
-    return F.kl_div(student_log_softmax, teacher_log_softmax, reduction="batchmean")
+    teacher_probs = F.softmax(teacher_scores / temperature_kl, dim=-1)
+
+    return F.kl_div(student_log_softmax, teacher_probs, reduction="batchmean")
+
+
+def kl_divergence_distillation_normalized(
+    student_query_embeddings: torch.Tensor,  # [B, V]
+    student_doc_embeddings: torch.Tensor,  # [B, N, V] (docs corresponding to each query)
+    teacher_scores: torch.Tensor,  # [B, N] (teacher's scores for q_i vs d_i_j)
+    temperature_kl: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Computes KL divergence loss after query and doc embedding normalization."""
+    if teacher_scores is None:
+        return torch.tensor(0.0, device=device)
+
+    student_query_norm = F.normalize(student_query_embeddings, dim=-1)
+    student_doc_norm = F.normalize(student_doc_embeddings, dim=-1)
+
+    # Student scores for q_i vs its own N documents
+    student_row_logits = torch.einsum(
+        "bv,bnv->bn", student_query_norm, student_doc_norm
+    )
+    student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
+
+    teacher_probs = F.softmax(teacher_scores / temperature_kl, dim=-1)
+
+    return F.kl_div(student_log_softmax, teacher_probs, reduction="batchmean")
 
 
 def calculate_margin_mse_distillation(
@@ -229,7 +254,7 @@ def contrastive_kd_loss(
     mse_loss = q_rep.new_tensor(0.0)
 
     if teacher_scores is not None:
-        kl_loss = calculate_kl_divergence_distillation(
+        kl_loss = kl_divergence_distillation(
             student_query_embeddings=q_rep,
             student_doc_embeddings=d_rep,
             teacher_scores=teacher_scores,
@@ -426,7 +451,7 @@ def contrastive_kd_loss_with_hard_negatives(
     mse_loss = q_rep.new_tensor(0.0)
 
     if teacher_scores is not None:
-        kl_loss = calculate_kl_divergence_distillation(
+        kl_loss = kl_divergence_distillation(
             student_query_embeddings=q_rep,
             student_doc_embeddings=d_rep,
             teacher_scores=teacher_scores,
@@ -501,5 +526,5 @@ def contrastive_kd_loss_with_hard_negatives(
         "avg_doc_non_zero_count": avg_doc_non_zero_count,
     }
 
-    total_loss: Tensor = triplet_loss + flops_loss + kl_loss + mse_loss
+    total_loss: Tensor = triplet_loss + kl_loss + mse_loss
     return total_loss, parts
