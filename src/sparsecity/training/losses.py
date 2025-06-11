@@ -149,13 +149,9 @@ def kl_divergence_distillation_normalized(
     student_row_logits = torch.einsum(
         "bv,bnv->bn", student_query_norm, student_doc_norm
     )
-    print(f"student_row_logits[0]: {student_row_logits[0].cpu().detach()}")
-    print(f"teacher_scores[0]: {teacher_scores[0].cpu().detach()}")
 
     student_log_softmax = F.log_softmax(student_row_logits / temperature_kl, dim=-1)
-    print(f"student_log_softmax[0]: {student_log_softmax[0].cpu().detach()}")
     teacher_probs = F.softmax(teacher_scores / temperature_kl, dim=-1)
-    print(f"teacher_probs[0]: {teacher_probs[0].cpu().detach()}")
 
     return F.kl_div(student_log_softmax, teacher_probs, reduction="batchmean")
 

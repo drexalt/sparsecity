@@ -68,6 +68,8 @@ class TrainingConfig:
     sample_size: int  # Number of negatives to sample from total num_negatives
     n_ways: int  # How many negatives to throw into InfoNCE loss
     proximity_threshold: float
+    mse_weight: float
+    kl_weight: float
     max_length: int
     lambda_d: float
     lambda_q: float
@@ -260,14 +262,15 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     EVAL_EVERY_MICRO = cfg.evaluation.eval_every_steps * accum_steps
 
     # Grad Cache
-    gc = GradCache(
-        models=[splade_model, splade_model],
-        chunk_sizes=cfg.mini_batch,
-        loss_fn=contrastive_kd_loss_with_hard_negatives,
-        mixed_precision="bf16" if cfg.bf16 else "fp32",
-        rep_grad_clip=cfg.optimizer.rep_grad_clip,
-        clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
-    )
+    if cfg.use_grad_cache:
+        gc = GradCache(
+            models=[splade_model, splade_model],
+            chunk_sizes=cfg.mini_batch,
+            loss_fn=contrastive_kd_loss_with_hard_negatives,
+            mixed_precision="bf16" if cfg.bf16 else "fp32",
+            rep_grad_clip=cfg.optimizer.rep_grad_clip,
+            clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
+        )
 
     safe_grad_window = deque(maxlen=200)
 
@@ -302,7 +305,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
             # optimizer.train()
 
-            mse_weight = torch.tensor(0.05, device=device)
+            mse_weight = torch.tensor(cfg.mse_weight, device=device)
+            kl_weight = torch.tensor(cfg.kl_weight, device=device)
             temperature_ce = torch.tensor(1.0, device=device)
             temperature_kl = torch.tensor(1.0, device=device)
             loss_scale = torch.tensor(1.0 / accum_steps, device=device)
@@ -320,6 +324,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 n_ways=cfg.n_ways,
                 teacher_scores=teacher_scores if cfg.use_distillation else None,
                 mse_weight=mse_weight,
+                kl_weight=kl_weight,
             )
 
             rep_grad_clip = (

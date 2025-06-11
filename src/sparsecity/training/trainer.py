@@ -663,6 +663,7 @@ def train_step_kldiv_NO_GC(
     n_ways: int | None = 32,
     teacher_scores: Optional[Tensor] = None,
     mse_weight: Optional[Tensor] = None,
+    kl_weight: Optional[Tensor] = None,
     rep_grad_clip: Optional[Tensor] = None,
     step: int,
     clip_start_step: int,
@@ -697,7 +698,7 @@ def train_step_kldiv_NO_GC(
     d_rep_flat_detached = d_rep_flat.detach().requires_grad_()
 
     # ---------------- Loss & metrics -----------------------------------------
-    total_loss, loss_parts = contrastive_kd_loss_with_hard_negatives(
+    total_loss, loss_parts = contrastive_kd_loss(
         q_rep=q_rep_detached,
         d_rep_flat=d_rep_flat_detached,
         n_docs_per_query=n_docs_per_query,
@@ -708,6 +709,7 @@ def train_step_kldiv_NO_GC(
         n_ways=n_ways,
         teacher_scores=teacher_scores,
         mse_weight=mse_weight,
+        kl_weight=kl_weight,
     )
     # ---------------- Back-prop ---------------------------------------------
     scaled_loss = total_loss * loss_scale
