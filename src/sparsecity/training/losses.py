@@ -528,5 +528,5 @@ def contrastive_kd_loss_with_hard_negatives(
         "avg_doc_non_zero_count": avg_doc_non_zero_count,
     }
 
-    total_loss: Tensor = triplet_loss + kl_loss + mse_loss
+    total_loss: Tensor = triplet_loss + kl_loss + mse_loss + flops_loss
     return total_loss, parts
