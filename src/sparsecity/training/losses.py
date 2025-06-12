@@ -255,7 +255,7 @@ def contrastive_kd_loss(
     mse_loss = q_rep.new_tensor(0.0)
 
     if teacher_scores is not None:
-        kl_loss = kl_divergence_distillation_normalized(
+        kl_loss = kl_divergence_distillation(
             student_query_embeddings=q_rep,
             student_doc_embeddings=d_rep,
             teacher_scores=teacher_scores,
@@ -453,7 +453,7 @@ def contrastive_kd_loss_with_hard_negatives(
     mse_loss = q_rep.new_tensor(0.0)
 
     if teacher_scores is not None:
-        kl_loss = kl_divergence_distillation_normalized(
+        kl_loss = kl_divergence_distillation(
             student_query_embeddings=q_rep,
             student_doc_embeddings=d_rep,
             teacher_scores=teacher_scores,
