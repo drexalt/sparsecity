@@ -698,7 +698,7 @@ def train_step_kldiv_NO_GC(
     d_rep_flat_detached = d_rep_flat.detach().requires_grad_()
 
     # ---------------- Loss & metrics -----------------------------------------
-    total_loss, loss_parts = contrastive_kd_loss(
+    total_loss, loss_parts = contrastive_kd_loss_with_hard_negatives(
         q_rep=q_rep_detached,
         d_rep_flat=d_rep_flat_detached,
         n_docs_per_query=n_docs_per_query,
