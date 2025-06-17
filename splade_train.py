@@ -41,9 +41,9 @@ from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig
 import dataclasses
-from schedulefree import AdamWScheduleFree
 from sparsecity.data.dataset import KDProcessing
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_wsd_schedule
+import heavyball
 
 from heapq import heappush, heappop
 import logging
@@ -125,32 +125,22 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     warmup_steps = cfg.optimizer.warmup_steps
 
-    def lambda_lr(step):
-        if warmup_steps == 0:
-            return 1.0
-        return min(1, step / warmup_steps)
+    # optimizer = torch.optim.AdamW(
+    #     optim_param_groups
+    #     if cfg.init_ce_temp is not None
+    #     else splade_model.parameters(),
+    #     lr=cfg.optimizer.learning_rate,
+    #     weight_decay=cfg.optimizer.weight_decay,
+    # )
 
-    optimizer = torch.optim.AdamW(
+    optimizer = heavyball.ForeachAdamW(
         optim_param_groups
         if cfg.init_ce_temp is not None
         else splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         weight_decay=cfg.optimizer.weight_decay,
+        caution=True,
     )
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda_lr,
-    )
-
-    # optimizer = AdamWScheduleFree(
-    #     optim_param_groups
-    #     if cfg.init_ce_temp is not None
-    #     else splade_model.parameters(),
-    #     warmup_steps=cfg.optimizer.warmup_steps,
-    #     weight_decay=cfg.optimizer.weight_decay,
-    #     betas=(0.98, 0.999),
-    # )
 
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
@@ -186,6 +176,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             drop_last=True,
         )
 
+    scheduler = get_wsd_schedule(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_decay_steps=cfg.optimizer.decay_steps,
+        min_lr_ratio=0.1,
+        num_stable_steps=cfg.optimizer.stable_steps,
+    )
+
     # Initialize wandb if enabled
     if cfg.wandb:
         wandb.init(
@@ -215,11 +213,6 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     )
     os.makedirs(checkpoint_directory, exist_ok=True)
     checkpoint_scores = []
-
-    def optimized_step():
-        optimizer.step()
-        # scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
 
     def maybe_optim_step(
         step_in_epoch: int,

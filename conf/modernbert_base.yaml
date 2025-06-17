@@ -20,12 +20,12 @@ sample_size: 8
 n_ways: null
 proximity_threshold: 0.05
 mse_weight: 0.05
-kl_weight: 30.0
+kl_weight: 1.0
 max_length: 256
-lambda_d: 5.0e-4
-lambda_q: 5.0e-4
-T_d: 50000
-T_q: 50000
+lambda_d: 0.0
+lambda_q: 0.0
+T_d: 80000
+T_q: 80000
 # Top-k scheduling
 top_k: null
 schedule_top_k: False
@@ -36,10 +36,12 @@ sparse_embed: False
 init_ce_temp: null
 init_kl_temp: null
 optimizer:
-  learning_rate: 3e-5
+  learning_rate: 6e-5
   warmup_steps: 5000
   grad_clip_warmup_steps: 6000
   weight_decay: 0.00
+  decay_steps: 50000
+  stable_steps: 280000
   max_grad_norm: null
   rep_grad_clip: null
 checkpoint:
