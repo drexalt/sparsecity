@@ -22,10 +22,10 @@ proximity_threshold: 0.05
 mse_weight: 0.05
 kl_weight: 1.0
 max_length: 256
-lambda_d: 0.0
-lambda_q: 0.0
-T_d: 80000
-T_q: 80000
+lambda_d: 5.0e-4
+lambda_q: 5.0e-4
+T_d: 50000
+T_q: 50000
 # Top-k scheduling
 top_k: null
 schedule_top_k: False
