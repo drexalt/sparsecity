@@ -548,9 +548,17 @@ def straight_distil(
     B, D = q_rep.shape
 
     d_rep = d_rep_flat.view(B, n_docs_per_query, D)  # [B, n_docs, D]
+    student_vocab_size = q_rep.size(-1)
+    teacher_vocab_size = teacher_q_rep.size(-1)
 
-    teacher_q_rep = F.pad(teacher_q_rep, (0, 6)).detach()  # [..., 30528]
-    teacher_d_rep_flat = F.pad(teacher_d_rep_flat, (0, 6)).detach()
+    if student_vocab_size > teacher_vocab_size:
+        pad_size = student_vocab_size - teacher_vocab_size
+        teacher_q_rep = F.pad(teacher_q_rep, (0, pad_size))
+        teacher_d_rep_flat = F.pad(teacher_d_rep_flat, (0, pad_size))
+    elif student_vocab_size < teacher_vocab_size:
+        teacher_q_rep = teacher_q_rep[..., :student_vocab_size]
+        teacher_d_rep_flat = teacher_d_rep_flat[..., :student_vocab_size]
+
     mse_loss = query_weight * F.mse_loss(
         q_rep, teacher_q_rep
     ) + doc_weight * F.mse_loss(d_rep_flat, teacher_d_rep_flat)
