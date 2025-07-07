@@ -1,0 +1,4 @@
+name: "chandar-lab/neobert"
+family: "bert"
+from_pt: True
+checkpoint_path: null # "checkpoint_step_413411_loss_0.2441.pt"

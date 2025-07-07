@@ -10,7 +10,11 @@ from .grad_cache import (
     GradCache,
     log_rep_grad_norms,
 )
-from .losses import contrastive_kd_loss, contrastive_kd_loss_with_hard_negatives
+from .losses import (
+    contrastive_kd_loss,
+    contrastive_kd_loss_with_hard_negatives,
+    straight_distil,
+)
 from contextlib import nullcontext
 
 
@@ -731,4 +735,71 @@ def train_step_kldiv_NO_GC(
     metrics.update({k: v.detach() for k, v in loss_parts.items()})
     metrics["q_grad_norm"] = q_grad_norm
     metrics["d_grad_norm"] = d_grad_norm
+    return metrics
+
+
+def train_step_straight_distil(
+    model: nn.Module,
+    teacher_model: nn.Module,
+    query_input_ids: Tensor,
+    query_attention_mask: Tensor,
+    doc_input_ids: Tensor,
+    doc_attention_mask: Tensor,
+    query_weight: Tensor,
+    doc_weight: Tensor,
+    loss_scale: Tensor,
+    bf16: bool = False,
+) -> Dict[str, Tensor]:
+    model.train()
+    teacher_model.eval()
+    B, n_docs_per_query, Ld = doc_input_ids.shape
+
+    # ---------------- Query representations ----------------------------------
+    doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
+    doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
+    with (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if bf16
+        else nullcontext()
+    ):
+        q_rep: Tensor = model(  # [B, D]
+            input_ids=query_input_ids,
+            attention_mask=query_attention_mask,
+        )
+        d_rep_flat: Tensor = model(  # [(B*n_docs), D]
+            input_ids=doc_input_ids_flat,
+            attention_mask=doc_attention_flat,
+        )
+        with torch.inference_mode():
+            teacher_q_rep: Tensor = teacher_model(  # [B, D]
+                input_ids=query_input_ids,
+                attention_mask=query_attention_mask,
+            )
+            teacher_d_rep_flat: Tensor = teacher_model(  # [(B*n_docs), D]
+                input_ids=doc_input_ids_flat,
+                attention_mask=doc_attention_flat,
+            )
+
+    # --------------- Document representations --------------------------------
+
+    # if bf16:
+    #     q_rep = q_rep.float()
+    #     d_rep_flat = d_rep_flat.float()
+    #     teacher_q_rep = teacher_q_rep.float()
+    #     teacher_d_rep_flat = teacher_d_rep_flat.float()
+
+    mse_loss, loss_parts = straight_distil(
+        q_rep=q_rep,
+        d_rep_flat=d_rep_flat,
+        teacher_q_rep=teacher_q_rep,
+        teacher_d_rep_flat=teacher_d_rep_flat,
+        n_docs_per_query=n_docs_per_query,
+        query_weight=query_weight,
+        doc_weight=doc_weight,
+    )
+    scaled_loss = mse_loss * loss_scale
+    scaled_loss.backward()
+
+    metrics: Dict[str, Tensor] = {"mse_loss": mse_loss.detach()}
+    metrics.update({k: v.detach() for k, v in loss_parts.items()})
     return metrics

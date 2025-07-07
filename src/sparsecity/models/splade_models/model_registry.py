@@ -26,6 +26,7 @@ def get_splade_model(
     init_ce_temp: Optional[float] = None,
     init_kl_temp: Optional[float] = None,
     top_k: Optional[int] = 128,
+    trust_remote_code: bool = True,
 ) -> SpladeModel:
     """
     Get a SPLADE model based on a pretrained transformer model.
@@ -52,7 +53,7 @@ def get_splade_model(
     transformer_model = AutoModelForMaskedLM.from_pretrained(
         model_name,
         config=config,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
     )
     if checkpoint_path:
         temp = torch.load(checkpoint_path, weights_only=False)

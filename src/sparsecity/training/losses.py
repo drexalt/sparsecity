@@ -530,3 +530,75 @@ def contrastive_kd_loss_with_hard_negatives(
 
     total_loss: Tensor = triplet_loss + kl_loss + mse_loss + flops_loss
     return total_loss, parts
+
+
+def straight_distil(
+    q_rep: Tensor,  # [B, D]
+    d_rep_flat: Tensor,  # [(B*n_docs), D]
+    n_docs_per_query: int,
+    teacher_q_rep: Tensor,  # [B, D]
+    teacher_d_rep_flat: Tensor,  # [(B*n_docs), D]
+    query_weight: Tensor,  # scalar
+    doc_weight: Tensor,  # scalar
+) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Straight distillation loss.
+    """
+
+    B, D = q_rep.shape
+
+    d_rep = d_rep_flat.view(B, n_docs_per_query, D)  # [B, n_docs, D]
+
+    teacher_q_rep = F.pad(teacher_q_rep, (0, 6)).detach()  # [..., 30528]
+    teacher_d_rep_flat = F.pad(teacher_d_rep_flat, (0, 6)).detach()
+    mse_loss = query_weight * F.mse_loss(
+        q_rep, teacher_q_rep
+    ) + doc_weight * F.mse_loss(d_rep_flat, teacher_d_rep_flat)
+    # --- Diagnostic sparsity / magnitude metrics -----------------------------
+    q_abs = q_rep.abs()
+    d_abs = d_rep.abs()
+
+    is_q_nonzero = q_abs > 1e-9
+    is_d_nonzero = d_abs > 1e-9
+
+    q_nonzero_vals = q_abs[is_q_nonzero]
+    d_nonzero_vals = d_abs[is_d_nonzero]
+
+    query_sparsity = (~is_q_nonzero).float().mean()
+    doc_sparsity = (~is_d_nonzero).float().mean()
+
+    query_min_non_zero = (
+        q_nonzero_vals.min() if q_nonzero_vals.numel() > 0 else q_rep.new_tensor(0.0)
+    )
+    doc_min_non_zero = (
+        d_nonzero_vals.min() if d_nonzero_vals.numel() > 0 else q_rep.new_tensor(0.0)
+    )
+
+    query_median_non_zero = (
+        torch.median(q_nonzero_vals)
+        if q_nonzero_vals.numel() > 0
+        else q_rep.new_tensor(0.0)
+    )
+    doc_median_non_zero = (
+        torch.median(d_nonzero_vals)
+        if d_nonzero_vals.numel() > 0
+        else q_rep.new_tensor(0.0)
+    )
+
+    avg_query_non_zero_count = is_q_nonzero.sum() / B
+    avg_doc_non_zero_count = is_d_nonzero.sum() / (B * n_docs_per_query)
+    parts: Dict[str, Tensor] = {
+        # Loss constituents
+        "mse_loss": mse_loss,
+        # Extra metrics
+        "query_sparsity": query_sparsity,
+        "doc_sparsity": doc_sparsity,
+        "query_min_non_zero": query_min_non_zero,
+        "doc_min_non_zero": doc_min_non_zero,
+        "query_median_non_zero": query_median_non_zero,
+        "doc_median_non_zero": doc_median_non_zero,
+        "avg_query_non_zero_count": avg_query_non_zero_count,
+        "avg_doc_non_zero_count": avg_doc_non_zero_count,
+    }
+
+    return mse_loss, parts

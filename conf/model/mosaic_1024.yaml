@@ -1,0 +1,4 @@
+name: "mosaicml/mosaic-bert-base-seqlen-1024"
+family: "mosaic"
+from_pt: False
+checkpoint_path: null
