@@ -5,6 +5,8 @@ import datasets
 import logging
 import random
 from plsfix import fix_text
+from torch.utils.data import IterableDataset
+from itertools import cycle
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +205,63 @@ class KDProcessing:
         processed_example["documents"] = documents
 
         return processed_example
+
+
+class QueryDocStream(IterableDataset):
+    """
+    Streams docs once and queries in an endless loop.
+    Each yield is a dict with keys 'query' and 'document'.
+    """
+
+    def __init__(self, docs_stream, queries_map):
+        self.docs_stream = docs_stream
+        self.queries_map = queries_map
+
+    def __len__(self):
+        return len(self.queries_map)
+
+    def __iter__(self):
+        docs_iter = iter(self.docs_stream)  # single pass
+        queries_iter = cycle(self.queries_map)  # infinite loop
+        for doc, query in zip(docs_iter, queries_iter):
+            yield {
+                "query": query["text"],
+                "document": doc["body"],
+                # keep titles etc. if you need them
+            }
+
+
+class MsmarcoDocumentCollateFn:
+    def __init__(self, tokenizer, max_length: int = 256):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        queries = [item["query"] for item in batch]
+        documents = [item["document"] for item in batch]
+
+        query_encodings = self.tokenizer(
+            queries,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+        doc_encodings = self.tokenizer(
+            documents,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        return (
+            query_encodings["input_ids"],
+            query_encodings["attention_mask"],
+            doc_encodings["input_ids"],
+            doc_encodings["attention_mask"],
+        )
 
 
 class CollateFn:
