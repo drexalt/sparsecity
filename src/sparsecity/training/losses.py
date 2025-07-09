@@ -1,7 +1,6 @@
 import torch
 from typing import Tuple, Optional, Dict
 from torch import Tensor
-import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -547,7 +546,7 @@ def straight_distil(
 
     B, D = q_rep.shape
 
-    d_rep = d_rep_flat.view(B, n_docs_per_query, D)  # [B, n_docs, D]
+    # d_rep = d_rep_flat.view(B, n_docs_per_query, D)  # [B, n_docs, D]
     student_vocab_size = q_rep.size(-1)
     teacher_vocab_size = teacher_q_rep.size(-1)
 
@@ -559,12 +558,19 @@ def straight_distil(
         teacher_q_rep = teacher_q_rep[..., :student_vocab_size]
         teacher_d_rep_flat = teacher_d_rep_flat[..., :student_vocab_size]
 
-    mse_loss = query_weight * F.mse_loss(
-        q_rep, teacher_q_rep
-    ) + doc_weight * F.mse_loss(d_rep_flat, teacher_d_rep_flat)
+    def balanced_mse(student: Tensor, teacher: Tensor, alpha: float) -> Tensor:
+        mask = (teacher.abs() > 1e-9).float()
+        w = 1.0 + alpha * mask
+        return (w * (student - teacher).pow(2)).mean()
+
+    loss_q = balanced_mse(q_rep, teacher_q_rep, 10.0)
+    loss_d = balanced_mse(d_rep_flat, teacher_d_rep_flat, 10.0)
+
+    mse_loss = loss_q + loss_d
+
     # --- Diagnostic sparsity / magnitude metrics -----------------------------
     q_abs = q_rep.abs()
-    d_abs = d_rep.abs()
+    d_abs = d_rep_flat.abs()
 
     is_q_nonzero = q_abs > 1e-9
     is_d_nonzero = d_abs > 1e-9

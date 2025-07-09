@@ -6,20 +6,12 @@ from collections import deque
 # from sparsecity.training.sparse_trainer import train_step
 from sparsecity.data.dataset import (
     MultipleNegativesCollateFn,
-    MultipleNegativesDistilCollateFn,
-    KDProcessingCollateFn,
+    MsmarcoDocumentCollateFn,
+    QueryDocStream,
 )
 from sparsecity.models.splade_models.model_registry import get_splade_model
-from sparsecity.training.grad_cache import GradCache
-from sparsecity.training.losses import (
-    contrastive_kd_loss,
-    contrastive_kd_loss_with_hard_negatives,
-)
 from sparsecity.utils.utils import (
     flatten_dict,
-    dump_debug_bundle,
-    compute_top_k,
-    compute_lambda_exact,
     update_checkpoint_tracking,
 )
 from sparsecity.evaluation.validate import validate_model
@@ -30,18 +22,17 @@ import os
 import torch
 from torch.utils.data import DataLoader
 import wandb
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, Features, Value
 from dataclasses import dataclass
 from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig
 import dataclasses
-from sparsecity.data.dataset import KDProcessing
 from transformers import get_wsd_schedule
 import heavyball
 from heavyball.utils import trust_region_clip_, rmsnorm_clip_
+import ir_datasets
 
-from heapq import heappush, heappop
 import logging
 
 torch.set_float32_matmul_precision("high")
@@ -65,20 +56,9 @@ class TrainingConfig:
     sample_size: int  # Number of negatives to sample from total num_negatives
     n_ways: int  # How many negatives to throw into InfoNCE loss
     proximity_threshold: float
-    mse_weight: float
-    kl_weight: float
-    max_length: int
-    lambda_d: float
-    lambda_q: float
-    T_d: float
-    T_q: float
     top_k: int
-    schedule_top_k: bool
-    initial_top_k: int
-    top_k_warmup_steps: int
+    max_length: int
     epochs: int
-    init_ce_temp: float
-    init_kl_temp: float
     log_every: int
     optimizer: DictConfig
     checkpoint: DictConfig
@@ -91,7 +71,9 @@ class TrainingConfig:
 logger = logging.getLogger(__name__)
 
 
-def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
+def train_model(
+    splade_model, teacher_model, tokenizer, cfg, docs_dataset, queries_dataset
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Move models to device
@@ -106,42 +88,22 @@ def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
 
     # Create optimizer and scheduler
 
-    # Separate learning rate for temperatures
-    if cfg.init_ce_temp is not None and cfg.init_kl_temp is not None:
-        temp_params = [splade_model.log_t_ce, splade_model.log_t_kl]
-        other_params = [
-            p
-            for n, p in splade_model.named_parameters()
-            if n not in {"log_t_ce", "log_t_kl"}
-        ]
-
-        optim_param_groups = [
-            {"params": temp_params, "lr": cfg.optimizer.learning_rate},
-            {"params": other_params, "lr": cfg.optimizer.learning_rate},
-        ]
-
     warmup_steps = cfg.optimizer.warmup_steps
 
     # optimizer = torch.optim.AdamW(
-    #     optim_param_groups
-    #     if cfg.init_ce_temp is not None
-    #     else splade_model.parameters(),
+    #     splade_model.parameters(),
     #     lr=cfg.optimizer.learning_rate,
     #     weight_decay=cfg.optimizer.weight_decay,
     # )
 
     # optimizer = heavyball.ForeachAdamW(
-    #     optim_param_groups
-    #     if cfg.init_ce_temp is not None
-    #     else splade_model.parameters(),
+    #     splade_model.parameters(),
     #     lr=cfg.optimizer.learning_rate,
     #     weight_decay=cfg.optimizer.weight_decay,
     #     caution=True,
     # )
     optimizer = heavyball.ForeachPSGDKron(
-        optim_param_groups
-        if cfg.init_ce_temp is not None
-        else splade_model.parameters(),
+        splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         weight_decay=cfg.optimizer.weight_decay,
         delayed=True,
@@ -154,24 +116,18 @@ def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
         tokenizer.model_max_length = cfg.max_length
     if cfg.use_distillation:
         dataloader = DataLoader(
-            dataset,
-            collate_fn=KDProcessingCollateFn(
-                tokenizer,
-                num_negatives=cfg.num_negatives,
-                sample_size=cfg.sample_size,
-                proximity_threshold=cfg.proximity_threshold,
-            ),
+            QueryDocStream(docs_dataset, queries_dataset),
+            collate_fn=MsmarcoDocumentCollateFn(tokenizer, max_length=cfg.max_length),
             batch_size=cfg.batch_size,
-            shuffle=True,
-            pin_memory=True,
-            num_workers=4,  # Add multiple workers for better data loading
-            persistent_workers=True,  # Keep workers alive between iterations
-            prefetch_factor=2,
+            # pin_memory=True,
+            num_workers=0,  # Add multiple workers for better data loading
+            # persistent_workers=True,  # Keep workers alive between iterations
+            # prefetch_factor=2,
             drop_last=True,
         )
     else:
         dataloader = DataLoader(
-            dataset,
+            QueryDocStream(docs_dataset, queries_dataset),
             collate_fn=MultipleNegativesCollateFn(
                 tokenizer, num_negatives=cfg.num_negatives
             ),
@@ -238,9 +194,7 @@ def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
             global_step += 1
 
             if cfg.use_distillation:
-                query_ids, query_mask, doc_ids, doc_mask, teacher_scores = (
-                    t.to(device) for t in batch
-                )
+                query_ids, query_mask, doc_ids, doc_mask = (t.to(device) for t in batch)
             else:
                 query_ids, query_mask, doc_ids, doc_mask = (t.to(device) for t in batch)
 
@@ -284,7 +238,7 @@ def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
             if cfg.wandb and global_step % LOG_EVERY_MICRO == 0:
                 wandb.log({**log_metrics}, step=global_step // accum_steps)
 
-            if (global_step + 1) % EVAL_EVERY_MICRO == 0 or global_step == 50:
+            if (global_step + 1) % EVAL_EVERY_MICRO == 0:
                 splade_model.eval()
                 # optimizer.eval()
                 val_results = validate_model(
@@ -316,7 +270,7 @@ def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
                 # Save checkpoint
                 checkpoint_scores = update_checkpoint_tracking(
                     step=global_step,
-                    score=val_results["msmarco_mrr@10"],
+                    score=val_results["mrr@10"],
                     checkpoint_scores=checkpoint_scores,
                     max_checkpoints=cfg.checkpoint.max_to_keep,
                     splade_model=splade_model,
@@ -328,7 +282,7 @@ def train_model(splade_model, teacher_model, tokenizer, cfg, dataset):
 @hydra.main(config_path="conf", config_name="mosaic_distil", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
-    config = BertConfig.from_pretrained(cfg.model.name, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(cfg.model.name, trust_remote_code=True)
     teacher_config = AutoConfig.from_pretrained(cfg.teacher_model)
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
@@ -337,7 +291,6 @@ def main(cfg: DictConfig):
         cfg.teacher_model,
         config=teacher_config,
         custom_kernel=cfg.custom_kernel,
-        top_k=cfg.top_k if cfg.top_k else None,
         trust_remote_code=False,
     )
 
@@ -349,9 +302,6 @@ def main(cfg: DictConfig):
         checkpoint_path=cfg.model.checkpoint_path
         if cfg.model.checkpoint_path
         else None,
-        top_k=cfg.top_k if cfg.top_k else None,
-        init_ce_temp=cfg.init_ce_temp,
-        init_kl_temp=cfg.init_kl_temp,
     )
 
     # train_dataset = load_dataset(
@@ -363,34 +313,53 @@ def main(cfg: DictConfig):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.seed)
 
-    train_dataset = load_dataset(
-        "lightonai/ms-marco-en-bge-gemma",
-        "train",
-        split="train",
-    )
+    # train_dataset = load_dataset(
+    #     "lightonai/ms-marco-en-bge-gemma",
+    #     "train",
+    #     split="train",
+    # )
 
-    queries = load_dataset(
-        "lightonai/ms-marco-en-bge-gemma",
-        "queries",
-        split="train",
-    )
+    # queries = load_dataset(
+    #     "lightonai/ms-marco-en-bge-gemma",
+    #     "queries",
+    #     split="train",
+    # )
 
-    documents = load_dataset(
-        "lightonai/ms-marco-en-bge-gemma",
-        "documents",
-        split="train",
-    )
+    # documents = load_dataset(
+    #     "lightonai/ms-marco-en-bge-gemma",
+    #     "documents",
+    #     split="train",
+    # )
 
-    train_dataset.set_transform(
-        KDProcessing(queries=queries, documents=documents).transform
-    )
+    # train_dataset.set_transform(
+    #     KDProcessing(queries=queries, documents=documents).transform
+    # )
     # set_torch()
+    train_docs = load_dataset(
+        "irds/msmarco-document-v2", "docs", trust_remote_code=True
+    )
+
+    def gen_queries():
+        for q in queries_iter:
+            yield {"query_id": q.query_id, "text": q.text}
+
+    queries_iter = ir_datasets.load("msmarco-document-v2/train").queries_iter()
+    train_queries = Dataset.from_generator(
+        gen_queries,
+        features=Features(
+            {
+                "query_id": Value("string"),
+                "text": Value("string"),
+            }
+        ),
+    )
     train_model(
         splade_model=model,
         teacher_model=teacher_model,
         tokenizer=tokenizer,
         cfg=cfg,
-        dataset=train_dataset,
+        docs_dataset=train_docs,
+        queries_dataset=train_queries,
     )  # Assumes same tokenizer for teacher and student, obviously
 
 

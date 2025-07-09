@@ -1,5 +1,4 @@
-from typing import Dict, Optional, List, Tuple
-from jaxtyping import Float, Int
+from typing import Dict, Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,10 +7,8 @@ from .grad_cache import (
     gc_backward_and_zero_grad,
     RandContext,
     GradCache,
-    log_rep_grad_norms,
 )
 from .losses import (
-    contrastive_kd_loss,
     contrastive_kd_loss_with_hard_negatives,
     straight_distil,
 )
@@ -752,11 +749,11 @@ def train_step_straight_distil(
 ) -> Dict[str, Tensor]:
     model.train()
     teacher_model.eval()
-    B, n_docs_per_query, Ld = doc_input_ids.shape
+    # B, Ld = doc_input_ids.shape
 
     # ---------------- Query representations ----------------------------------
-    doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
-    doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
+    # doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
+    # doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
     with (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if bf16
@@ -767,8 +764,8 @@ def train_step_straight_distil(
             attention_mask=query_attention_mask,
         )
         d_rep_flat: Tensor = model(  # [(B*n_docs), D]
-            input_ids=doc_input_ids_flat,
-            attention_mask=doc_attention_flat,
+            input_ids=doc_input_ids,
+            attention_mask=doc_attention_mask,
         )
         with torch.inference_mode():
             teacher_q_rep: Tensor = teacher_model(  # [B, D]
@@ -776,8 +773,8 @@ def train_step_straight_distil(
                 attention_mask=query_attention_mask,
             )
             teacher_d_rep_flat: Tensor = teacher_model(  # [(B*n_docs), D]
-                input_ids=doc_input_ids_flat,
-                attention_mask=doc_attention_flat,
+                input_ids=doc_input_ids,
+                attention_mask=doc_attention_mask,
             )
 
     # --------------- Document representations --------------------------------
@@ -793,7 +790,7 @@ def train_step_straight_distil(
         d_rep_flat=d_rep_flat,
         teacher_q_rep=teacher_q_rep,
         teacher_d_rep_flat=teacher_d_rep_flat,
-        n_docs_per_query=n_docs_per_query,
+        n_docs_per_query=1,
         query_weight=query_weight,
         doc_weight=doc_weight,
     )
