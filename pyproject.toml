@@ -19,3 +19,6 @@ dependencies = [
     "transformers>=4.48.0",
     "wandb>=0.19.4",
 ]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
