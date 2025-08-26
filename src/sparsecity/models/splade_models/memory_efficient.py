@@ -110,8 +110,8 @@ def sparse_activation(
         values.stride(1),
         argmax_indices.stride(0),
         argmax_indices.stride(1),
-        BLOCK_V=1024,
-        BLOCK_S=128,
+        BLOCK_V=256,
+        BLOCK_S=64,
     )
 
     sparse_activation._argmax_indices = argmax_indices  # Temporary storage
