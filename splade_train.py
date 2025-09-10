@@ -144,37 +144,22 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
-    if cfg.use_distillation:
-        dataloader = DataLoader(
-            dataset,
-            collate_fn=KDProcessingCollateFn(
-                tokenizer,
-                num_negatives=cfg.num_negatives,
-                sample_size=cfg.sample_size,
-                proximity_threshold=cfg.proximity_threshold,
-            ),
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            pin_memory=True,
-            num_workers=4,  # Add multiple workers for better data loading
-            persistent_workers=True,  # Keep workers alive between iterations
-            prefetch_factor=2,
-            drop_last=True,
-        )
-    else:
-        dataloader = DataLoader(
-            dataset,
-            collate_fn=MultipleNegativesCollateFn(
-                tokenizer, num_negatives=cfg.num_negatives
-            ),
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            pin_memory=True,
-            num_workers=4,  # Add multiple workers for better data loading
-            persistent_workers=True,  # Keep workers alive between iterations
-            prefetch_factor=2,
-            drop_last=True,
-        )
+    dataloader = DataLoader(
+        dataset,
+        collate_fn=KDProcessingCollateFn(
+            tokenizer,
+            num_negatives=cfg.num_negatives,
+            sample_size=cfg.sample_size,
+            proximity_threshold=cfg.proximity_threshold,
+        ),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=4,  # Add multiple workers for better data loading
+        persistent_workers=True,  # Keep workers alive between iterations
+        prefetch_factor=2,
+        drop_last=True,
+    )
 
     scheduler = get_wsd_schedule(
         optimizer,
@@ -272,22 +257,9 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             global_step += 1
 
-            # Top-k scheduling
-            if cfg.schedule_top_k:
-                current_top_k = compute_top_k(
-                    initial_top_k=cfg.initial_top_k,
-                    final_top_k=cfg.top_k,
-                    global_step=global_step // accum_steps,
-                    warmup_steps=cfg.top_k_warmup_steps,
-                )
-                splade_model.top_k = current_top_k
-
-            if cfg.use_distillation:
-                query_ids, query_mask, doc_ids, doc_mask, teacher_scores = (
-                    t.to(device) for t in batch
-                )
-            else:
-                query_ids, query_mask, doc_ids, doc_mask = (t.to(device) for t in batch)
+            query_ids, query_mask, doc_ids, doc_mask, teacher_scores = (
+                t.to(device) for t in batch
+            )
 
             lambda_t_d = compute_lambda_exact(
                 cfg.lambda_d, global_step // accum_steps, cfg.T_d
