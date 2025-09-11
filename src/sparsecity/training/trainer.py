@@ -669,6 +669,7 @@ def train_step_kldiv_NO_GC(
     step: int,
     clip_start_step: int,
     bf16: bool = False,
+    adaptive_ce: Optional[bool] = False,
 ) -> Dict[str, Tensor]:
     model.train()  # ensure dropout etc. are on
     B, n_docs_per_query, Ld = doc_input_ids.shape
@@ -711,6 +712,7 @@ def train_step_kldiv_NO_GC(
         teacher_scores=teacher_scores,
         mse_weight=mse_weight,
         kl_weight=kl_weight,
+        adaptive_ce=adaptive_ce,
     )
     # ---------------- Back-prop ---------------------------------------------
     scaled_loss = total_loss * loss_scale

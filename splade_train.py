@@ -257,9 +257,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             global_step += 1
 
-            query_ids, query_mask, doc_ids, doc_mask, teacher_scores = (
-                t.to(device) for t in batch
-            )
+            query_ids, query_mask, document_ids, document_mask, teacher_scores = batch
+            query_ids = query_ids.to(device)
+            query_mask = query_mask.to(device)
+            document_ids = document_ids.to(device)
+            document_mask = document_mask.to(device)
+            teacher_scores = teacher_scores.to(device) if cfg.use_distillation else None
 
             lambda_t_d = compute_lambda_exact(
                 cfg.lambda_d, global_step // accum_steps, cfg.T_d
@@ -280,8 +283,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 model=splade_model,
                 query_input_ids=query_ids,
                 query_attention_mask=query_mask,
-                doc_input_ids=doc_ids,
-                doc_attention_mask=doc_mask,
+                doc_input_ids=document_ids,
+                doc_attention_mask=document_mask,
                 lambda_t_d=torch.tensor(lambda_t_d, device=device),
                 lambda_t_q=torch.tensor(lambda_t_q, device=device),
                 temperature_ce=temperature_ce,
@@ -311,6 +314,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     step=global_step,
                     clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
                     bf16=cfg.bf16,
+                    adaptive_ce=True,
                 )
 
             grad_norm_val, exploded, stepped = maybe_optim_step(

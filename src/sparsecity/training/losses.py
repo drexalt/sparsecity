@@ -180,6 +180,36 @@ def calculate_margin_mse_distillation(
     return F.mse_loss(student_margins, teacher_margins)
 
 
+# --------------------------- Adaptive CE helper -----------------------------
+def compute_adaptive_ce_temperature(
+    logits_ce: Tensor,
+    target_gap: float = 5.0,
+    min_temp: float = 1.0,
+    max_temp: float = 4096.0,
+    reduce: str = "max",
+) -> Tensor:
+    """
+    Compute an adaptive temperature for CE/InfoNCE from gathered logits.
+
+    Assumes column 0 is the positive and columns 1..K are negatives.
+    Chooses T so that mean(pos - neg_summary)/T ~= target_gap, clamped to [min_temp, max_temp].
+    Returns a scalar tensor on the same device as `logits_ce`.
+    """
+    if logits_ce.size(1) <= 1:
+        return logits_ce.new_tensor(float(min_temp))
+
+    pos = logits_ce[:, 0]
+    if reduce == "mean":
+        neg = logits_ce[:, 1:].mean(dim=1)
+    else:  # "max" by default
+        neg = logits_ce[:, 1:].max(dim=1).values
+
+    mean_gap = (pos - neg).clamp_min(1e-6).mean()
+    temp = mean_gap / float(target_gap)
+    temp = torch.clamp(temp, min=float(min_temp), max=float(max_temp))
+    return temp
+
+
 def contrastive_kd_loss(
     q_rep: Tensor,  # [B, D]
     d_rep_flat: Tensor,  # [(B*n_docs), D]
@@ -192,6 +222,11 @@ def contrastive_kd_loss(
     teacher_scores: Optional[Tensor] = None,  # [B, n_docs]
     mse_weight: Optional[Tensor] = None,
     kl_weight: Optional[Tensor] = None,
+    *,
+    adaptive_ce: bool = False,
+    ce_target_gap: float = 5.0,
+    ce_min_temp: float = 1.0,
+    ce_max_temp: float = 4096.0,
 ) -> Tensor:
     """Combined CE‑based contrastive loss + regularisation + KD."""
 
@@ -236,7 +271,17 @@ def contrastive_kd_loss(
     labels_ce = torch.zeros(B, dtype=torch.long, device=device)
 
     # --- 1. Triplet / contrastive CE loss ------------------------------------
-    triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, temperature_ce)
+    ce_temp_used = temperature_ce
+    if adaptive_ce and logits_ce.size(1) > 1:
+        with torch.no_grad():
+            ce_temp_used = compute_adaptive_ce_temperature(
+                logits_ce,
+                target_gap=ce_target_gap,
+                min_temp=ce_min_temp,
+                max_temp=ce_max_temp,
+                reduce="max",
+            )
+    triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, ce_temp_used)
 
     # --- 2. FLOPs regularisation ---------------------------------------------
     flops_loss = calculate_flops_regularization(
@@ -318,6 +363,9 @@ def contrastive_kd_loss(
         "anti_zero_loss": anti_zero_loss,
         "kl_loss": kl_loss,
         "mse_loss": mse_loss,
+        "ce_temperature": ce_temp_used
+        if isinstance(ce_temp_used, Tensor)
+        else q_rep.new_tensor(float(ce_temp_used)),
         # Extra metrics
         "query_sparsity": query_sparsity,
         "doc_sparsity": doc_sparsity,
@@ -345,6 +393,11 @@ def contrastive_kd_loss_with_hard_negatives(
     teacher_scores: Optional[Tensor] = None,  # [B, n_docs]
     mse_weight: Optional[Tensor] = None,
     kl_weight: Optional[Tensor] = None,
+    *,
+    adaptive_ce: bool = False,
+    ce_target_gap: float = 5.0,
+    ce_min_temp: float = 1.0,
+    ce_max_temp: float = 1024.0,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Combined CE-based contrastive loss + regularization + KD with hard negatives from triplet."""
 
@@ -376,15 +429,11 @@ def contrastive_kd_loss_with_hard_negatives(
     hard_neg_cols = torch.cat(hard_neg_indices, dim=0).view(
         B, n_docs_per_query - 1
     )  # [B, n_docs_per_query-1]
-    is_positive = torch.zeros(B * n_docs_per_query, dtype=torch.bool, device=device)
-    is_positive[pos_idx_flat] = True
-    # Identify in-batch negative indices (excluding query's own documents)
+    # Identify in-batch negative indices (exclude docs owned by the same query)
     owner = (
         torch.arange(B * n_docs_per_query, device=device) // n_docs_per_query
     )  # [B*n_docs]
-    neg_mask = (
-        owner.unsqueeze(0) != torch.arange(B, device=device).unsqueeze(1) & ~is_positive
-    )  # [B, B*n_docs]
+    neg_mask = owner.unsqueeze(0) != torch.arange(B, device=device).unsqueeze(1)
     all_cols = torch.arange(B * n_docs_per_query, device=device).expand(
         B, -1
     )  # [B, B*n_docs]
@@ -434,7 +483,17 @@ def contrastive_kd_loss_with_hard_negatives(
     labels_ce = torch.zeros(B, dtype=torch.long, device=device)
 
     # --- 1. Triplet / contrastive CE loss ------------------------------------
-    triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, temperature_ce)
+    ce_temp_used = temperature_ce
+    if adaptive_ce and logits_ce.size(1) > 1:
+        with torch.no_grad():
+            ce_temp_used = compute_adaptive_ce_temperature(
+                logits_ce,
+                target_gap=ce_target_gap,
+                min_temp=ce_min_temp,
+                max_temp=ce_max_temp,
+                reduce="max",
+            )
+    triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, ce_temp_used)
 
     # --- 2. FLOPs regularization ---------------------------------------------
     flops_loss = calculate_flops_regularization(
@@ -516,6 +575,9 @@ def contrastive_kd_loss_with_hard_negatives(
         "anti_zero_loss": anti_zero_loss,
         "kl_loss": kl_loss,
         "mse_loss": mse_loss,
+        "ce_temperature": ce_temp_used
+        if isinstance(ce_temp_used, Tensor)
+        else q_rep.new_tensor(float(ce_temp_used)),
         # Extra metrics
         "query_sparsity": query_sparsity,
         "doc_sparsity": doc_sparsity,
