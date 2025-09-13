@@ -180,6 +180,36 @@ def calculate_margin_mse_distillation(
     return F.mse_loss(student_margins, teacher_margins)
 
 
+# --------------------------- Adaptive CE helper -----------------------------
+def compute_adaptive_ce_temperature(
+    logits_ce: Tensor,
+    target_gap: float = 5.0,
+    min_temp: float = 1.0,
+    max_temp: float = 4096.0,
+    reduce: str = "max",
+) -> Tensor:
+    """
+    Compute an adaptive temperature for CE/InfoNCE from gathered logits.
+
+    Assumes column 0 is the positive and columns 1..K are negatives.
+    Chooses T so that mean(pos - neg_summary)/T ~= target_gap, clamped to [min_temp, max_temp].
+    Returns a scalar tensor on the same device as `logits_ce`.
+    """
+    if logits_ce.size(1) <= 1:
+        return logits_ce.new_tensor(float(min_temp))
+
+    pos = logits_ce[:, 0]
+    if reduce == "mean":
+        neg = logits_ce[:, 1:].mean(dim=1)
+    else:  # "max" by default
+        neg = logits_ce[:, 1:].max(dim=1).values
+
+    mean_gap = (pos - neg).clamp_min(1e-6).mean()
+    temp = mean_gap / float(target_gap)
+    temp = torch.clamp(temp, min=float(min_temp), max=float(max_temp))
+    return temp
+
+
 def contrastive_kd_loss(
     q_rep: Tensor,  # [B, D]
     d_rep_flat: Tensor,  # [(B*n_docs), D]
@@ -383,8 +413,8 @@ def contrastive_kd_loss_with_hard_negatives(
         torch.arange(B * n_docs_per_query, device=device) // n_docs_per_query
     )  # [B*n_docs]
     neg_mask = (
-        owner.unsqueeze(0) != torch.arange(B, device=device).unsqueeze(1) & ~is_positive
-    )  # [B, B*n_docs]
+        owner.unsqueeze(0) != torch.arange(B, device=device).unsqueeze(1)
+    ) & ~is_positive  # [B, B*n_docs]
     all_cols = torch.arange(B * n_docs_per_query, device=device).expand(
         B, -1
     )  # [B, B*n_docs]
@@ -429,13 +459,11 @@ def contrastive_kd_loss_with_hard_negatives(
 
     # Gather per-query logits (still in fp32 for numerical stability)
     logits_ce = scores_full.gather(1, gather_cols)
-
     # Cross-entropy labels: positive always in column 0
     labels_ce = torch.zeros(B, dtype=torch.long, device=device)
 
     # --- 1. Triplet / contrastive CE loss ------------------------------------
     triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, temperature_ce)
-
     # --- 2. FLOPs regularization ---------------------------------------------
     flops_loss = calculate_flops_regularization(
         query_embeddings=q_rep,
@@ -537,8 +565,7 @@ def straight_distil(
     n_docs_per_query: int,
     teacher_q_rep: Tensor,  # [B, D]
     teacher_d_rep_flat: Tensor,  # [(B*n_docs), D]
-    query_weight: Tensor,  # scalar
-    doc_weight: Tensor,  # scalar
+    alpha: Tensor,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """
     Straight distillation loss.
@@ -563,8 +590,8 @@ def straight_distil(
         w = 1.0 + alpha * mask
         return (w * (student - teacher).pow(2)).mean()
 
-    loss_q = balanced_mse(q_rep, teacher_q_rep, 10.0)
-    loss_d = balanced_mse(d_rep_flat, teacher_d_rep_flat, 10.0)
+    loss_q = balanced_mse(q_rep, teacher_q_rep, alpha)
+    loss_d = balanced_mse(d_rep_flat, teacher_d_rep_flat, alpha)
 
     mse_loss = loss_q + loss_d
 

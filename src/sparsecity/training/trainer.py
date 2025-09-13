@@ -614,6 +614,7 @@ def train_step_kldiv_gradcache(
     n_ways: Optional[int] = 32,
     teacher_scores: Optional[Tensor] = None,
     mse_weight: Optional[Tensor] = None,
+    kl_weight: Optional[Tensor] = None,
 ) -> Dict[str, Tensor]:
     model.train()
 
@@ -672,7 +673,6 @@ def train_step_kldiv_NO_GC(
 ) -> Dict[str, Tensor]:
     model.train()  # ensure dropout etc. are on
     B, n_docs_per_query, Ld = doc_input_ids.shape
-
     # ---------------- Query representations ----------------------------------
     doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
     doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
@@ -742,9 +742,8 @@ def train_step_straight_distil(
     query_attention_mask: Tensor,
     doc_input_ids: Tensor,
     doc_attention_mask: Tensor,
-    query_weight: Tensor,
-    doc_weight: Tensor,
     loss_scale: Tensor,
+    alpha: Tensor,
     bf16: bool = False,
 ) -> Dict[str, Tensor]:
     model.train()
@@ -791,8 +790,7 @@ def train_step_straight_distil(
         teacher_q_rep=teacher_q_rep,
         teacher_d_rep_flat=teacher_d_rep_flat,
         n_docs_per_query=1,
-        query_weight=query_weight,
-        doc_weight=doc_weight,
+        alpha=alpha,
     )
     scaled_loss = mse_loss * loss_scale
     scaled_loss.backward()

@@ -125,22 +125,22 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     warmup_steps = cfg.optimizer.warmup_steps
 
-    # optimizer = torch.optim.AdamW(
-    #     optim_param_groups
-    #     if cfg.init_ce_temp is not None
-    #     else splade_model.parameters(),
-    #     lr=cfg.optimizer.learning_rate,
-    #     weight_decay=cfg.optimizer.weight_decay,
-    # )
-
-    optimizer = heavyball.ForeachAdamW(
+    optimizer = torch.optim.AdamW(
         optim_param_groups
         if cfg.init_ce_temp is not None
         else splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         weight_decay=cfg.optimizer.weight_decay,
-        caution=True,
     )
+    #
+    # optimizer = heavyball.ForeachAdamW(
+    #     optim_param_groups
+    #     if cfg.init_ce_temp is not None
+    #     else splade_model.parameters(),
+    #     lr=cfg.optimizer.learning_rate,
+    #     weight_decay=cfg.optimizer.weight_decay,
+    #     caution=True,
+    # )
 
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
@@ -236,8 +236,6 @@ def train_model(splade_model, tokenizer, cfg, dataset):
 
     global_step = 0
     accum_steps = cfg.accum_steps
-    LOG_EVERY_MICRO = cfg.log_every * accum_steps
-    EVAL_EVERY_MICRO = cfg.evaluation.eval_every_steps * accum_steps
 
     # Grad Cache
     if cfg.use_grad_cache:
@@ -257,9 +255,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             global_step += 1
 
-            query_ids, query_mask, doc_ids, doc_mask, teacher_scores = (
-                t.to(device) for t in batch
-            )
+            query_ids, query_mask, document_ids, document_mask, teacher_scores = batch
+            query_ids = query_ids.to(device)
+            query_mask = query_mask.to(device)
+            document_ids = document_ids.to(device)
+            document_mask = document_mask.to(device)
+            teacher_scores = teacher_scores.to(device) if cfg.use_distillation else None
 
             lambda_t_d = compute_lambda_exact(
                 cfg.lambda_d, global_step // accum_steps, cfg.T_d
@@ -280,8 +281,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 model=splade_model,
                 query_input_ids=query_ids,
                 query_attention_mask=query_mask,
-                doc_input_ids=doc_ids,
-                doc_attention_mask=doc_mask,
+                doc_input_ids=document_ids,
+                doc_attention_mask=document_mask,
                 lambda_t_d=torch.tensor(lambda_t_d, device=device),
                 lambda_t_q=torch.tensor(lambda_t_q, device=device),
                 temperature_ce=temperature_ce,
@@ -320,20 +321,20 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 safe_grad_window=safe_grad_window,
             )
 
-            if exploded:
-                dump_debug_bundle(
-                    batch,
-                    splade_model,
-                    optimizer,
-                    global_step,
-                    use_distillation=cfg.use_distillation,
-                    path=checkpoint_directory,
-                )
-                logger.error(
-                    f"Gradient explosion at step {global_step}. Skipping batch. Batch logged to {checkpoint_directory}/debug_step_{global_step}.pt"
-                )
-                continue
-
+            # if exploded:
+            #     dump_debug_bundle(
+            #         batch,
+            #         splade_model,
+            #         optimizer,
+            #         global_step,
+            #         use_distillation=cfg.use_distillation,
+            #         path=checkpoint_directory,
+            #     )
+            #     logger.error(
+            #         f"Gradient explosion at step {global_step}. Skipping batch. Batch logged to {checkpoint_directory}/debug_step_{global_step}.pt"
+            #     )
+            #     continue
+            #
             log_metrics = {
                 "loss/total_loss": metrics["total_loss"].item(),
                 "loss/triplet_loss": metrics["triplet_loss"].item(),
@@ -358,10 +359,12 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             if metrics["d_grad_norm"] is not None:
                 log_metrics["metrics/d_grad_norm"] = metrics["d_grad_norm"]
 
-            if cfg.wandb and global_step % LOG_EVERY_MICRO == 0:
-                wandb.log({**log_metrics}, step=global_step // accum_steps)
+            if cfg.wandb and global_step % cfg.log_every == 0:
+                wandb.log({**log_metrics}, step=global_step)
 
-            if (global_step + 1) % EVAL_EVERY_MICRO == 0 or global_step == 50:
+            if (
+                global_step + 1
+            ) % cfg.evaluation.eval_every_steps == 0 or global_step == 50:
                 splade_model.eval()
                 # optimizer.eval()
                 val_results = validate_model(
@@ -387,7 +390,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                                 if k not in ["ndcg@10", "mrr@10", "map@100"]
                             },
                         },
-                        step=global_step // accum_steps,
+                        step=global_step,
                     )
 
                 # Save checkpoint
@@ -402,11 +405,11 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                 )
 
 
-@hydra.main(config_path="conf", config_name="cocondenser_base", version_base=None)
+@hydra.main(config_path="conf", config_name="neo_base", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
     config = AutoConfig.from_pretrained(cfg.model.name, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model = get_splade_model(
         cfg.model.name,
         config=config,
