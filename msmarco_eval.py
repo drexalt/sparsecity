@@ -34,9 +34,16 @@ corpus_max_size = 0
 device = "cuda"
 ####  Load model
 splade_model = get_splade_model(
-    "answerdotai/modernbert-base", device=device, sparse_embed=False, custom_kernel=True
+    "answerdotai/modernbert-base",
+    device=device,
+    sparse_embed=False,
+    custom_kernel=True,
+    top_k=256,
 )
-state_dict = torch.load("checkpoint_step_177595_ndcg_0.7757.pt", weights_only=False)
+state_dict = torch.load(
+    "checkpoint_step_151999_msmarco_mrr@10_0.6432.pt",
+    weights_only=False,
+)
 state_dict = state_dict["splade_model"]
 
 splade_model.load_state_dict(state_dict)
@@ -124,9 +131,10 @@ ir_evaluator = evaluation.InformationRetrievalEvaluator(
     show_progress_bar=True,
     batch_size=128,
     score_functions={"dot": dot_score},
-    corpus_chunk_size=100000,
-    precision_recall_at_k=[10, 100],
-    name="msmarco dev",
+    corpus_chunk_size=50000,
+    precision_recall_at_k=[10, 100, 1000],
+    name="msmarco_dev_modernbert_dashing_sponge_256",
+    write_csv=True,
 )
 
-ir_evaluator(st_model)
+ir_evaluator(st_model, output_path="ir_results/")

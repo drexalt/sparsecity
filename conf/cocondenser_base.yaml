@@ -10,11 +10,11 @@ data:
 
 use_distillation: True
 custom_kernel: True
-use_grad_cache: False
+use_grad_cache: True
 bf16: True
 accum_steps: 4
-batch_size: 8
-mini_batch: 64
+batch_size: 4
+mini_batch: 8
 num_negatives: 32
 sample_size: 12
 n_ways: null

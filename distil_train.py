@@ -96,21 +96,21 @@ def train_model(
     #     weight_decay=cfg.optimizer.weight_decay,
     # )
 
-    # optimizer = heavyball.ForeachAdamW(
-    #     splade_model.parameters(),
-    #     lr=cfg.optimizer.learning_rate,
-    #     weight_decay=cfg.optimizer.weight_decay,
-    #     caution=True,
-    # )
-    optimizer = heavyball.ForeachPSGDKron(
+    optimizer = heavyball.ForeachAdamW(
         splade_model.parameters(),
         lr=cfg.optimizer.learning_rate,
         weight_decay=cfg.optimizer.weight_decay,
-        delayed=True,
-        cached=True,
-        gradient_clipping=trust_region_clip_,
-        update_clipping=rmsnorm_clip_,
+        caution=True,
     )
+    # optimizer = heavyball.ForeachPSGDKron(
+    #     splade_model.parameters(),
+    #     lr=cfg.optimizer.learning_rate,
+    #     weight_decay=cfg.optimizer.weight_decay,
+    #     delayed=True,
+    #     cached=True,
+    #     gradient_clipping=trust_region_clip_,
+    #     update_clipping=rmsnorm_clip_,
+    # )
 
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
@@ -203,6 +203,7 @@ def train_model(
             doc_weight = torch.tensor(1.0, device=device)
 
             loss_scale = torch.tensor(1.0 / accum_steps, device=device)
+            alpha = torch.tensor(10.0, device=device)
 
             train_kwargs = dict(
                 model=splade_model,
@@ -211,9 +212,10 @@ def train_model(
                 query_attention_mask=query_mask,
                 doc_input_ids=doc_ids,
                 doc_attention_mask=doc_mask,
-                query_weight=query_weight,
-                doc_weight=doc_weight,
+                # query_weight=query_weight,
+                # doc_weight=doc_weight,
                 loss_scale=loss_scale,
+                alpha=alpha,
             )
 
             metrics = train_step_straight_distil(
@@ -282,7 +284,7 @@ def train_model(
 @hydra.main(config_path="conf", config_name="mosaic_distil", version_base=None)
 def main(cfg: DictConfig):
     cfg = TrainingConfig(**cfg)
-    config = AutoConfig.from_pretrained(cfg.model.name, trust_remote_code=True)
+    config = BertConfig.from_pretrained(cfg.model.name, trust_remote_code=True)
     teacher_config = AutoConfig.from_pretrained(cfg.teacher_model)
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 

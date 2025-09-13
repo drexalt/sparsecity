@@ -5,6 +5,9 @@ from sentence_transformers import SentenceTransformer, util
 import torch
 from plsfix import fix_text
 
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
 # Configure logging to output to both console and a log file.
 logging.basicConfig(
     level=logging.INFO,
@@ -15,8 +18,10 @@ logging.basicConfig(
 model = SentenceTransformer(
     "dunzhang/stella_en_1.5B_v5",
     trust_remote_code=True,
-    model_kwargs={"torch_dtype": torch.float16},
+    # model_kwargs={"torch_dtype": torch.float16},
 ).cuda()
+
+model.compile(mode="max-autotune")
 
 query_prompt_name = "s2p_query"
 

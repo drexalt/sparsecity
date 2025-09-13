@@ -1,4 +1,4 @@
 name: "luyu/co-condenser-marco"
 family: "bert"
 from_pt: True
-checkpoint_path: null #"checkpoint_step_239204_loss_4.2543.pt"
+checkpoint_path: null # "checkpoint_step_413411_loss_0.2441.pt"

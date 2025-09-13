@@ -312,6 +312,7 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     step=global_step,
                     clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
                     bf16=cfg.bf16,
+                    adaptive_ce=True,
                 )
 
             grad_norm_val, exploded, stepped = maybe_optim_step(

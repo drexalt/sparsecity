@@ -1,4 +1,4 @@
 name: "answerdotai/modernbert-base"
 family: "modernbert"
 from_pt: False
-checkpoint_path: null      # "checkpoint_step_29639_loss_5.0292.pt"
+checkpoint_path:  "checkpoint_step_468409_loss_0.1165.pt" # "modernbert_lexmae_loss_5.0292.pt"  # "checkpoint_step_301704_loss_5.5669.pt"      

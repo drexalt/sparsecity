@@ -10,7 +10,7 @@ data:
 
 use_distillation: True
 teacher_model: "naver/splade-v3"
-custom_kernel: True
+custom_kernel: False
 use_grad_cache: False
 bf16: True
 accum_steps: 2

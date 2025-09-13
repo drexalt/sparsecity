@@ -25,7 +25,7 @@ def get_splade_model(
     checkpoint_path: str = None,
     init_ce_temp: Optional[float] = None,
     init_kl_temp: Optional[float] = None,
-    top_k: Optional[int] = 128,
+    top_k: Optional[int] = None,
     trust_remote_code: bool = True,
 ) -> SpladeModel:
     """
