@@ -4,6 +4,7 @@ from sparsecity.training.trainer import (
     train_step_mse,
     train_step_kldiv_gradcache,
     train_step_kldiv_NO_GC,
+    train_step_distil_scores,
 )
 from datetime import datetime
 from collections import deque
@@ -320,14 +321,14 @@ def train_model(splade_model, tokenizer, cfg, dataset):
                     **train_kwargs,
                 )
             else:
-                metrics = train_step_kldiv_NO_GC(
+                metrics = train_step_distil_scores(
                     **train_kwargs,
                     loss_scale=loss_scale,
                     rep_grad_clip=rep_grad_clip,
                     step=global_step,
                     clip_start_step=cfg.optimizer.grad_clip_warmup_steps,
                     bf16=cfg.bf16,
-                    adaptive_ce=True,
+                    # adaptive_ce=True,
                 )
 
             grad_norm_val, exploded, stepped = maybe_optim_step(

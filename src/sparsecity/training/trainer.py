@@ -11,6 +11,7 @@ from .grad_cache import (
 from .losses import (
     contrastive_kd_loss_with_hard_negatives,
     straight_distil,
+    mixed_distillation_only_loss,
 )
 from contextlib import nullcontext
 
@@ -730,6 +731,99 @@ def train_step_kldiv_NO_GC(
     d_rep_flat.backward(d_rep_flat_detached.grad)
 
     # --------------- Return detached metrics ---------------------------------
+    metrics: Dict[str, Tensor] = {"total_loss": total_loss.detach()}
+    metrics.update({k: v.detach() for k, v in loss_parts.items()})
+    metrics["q_grad_norm"] = q_grad_norm
+    metrics["d_grad_norm"] = d_grad_norm
+    return metrics
+
+
+def train_step_distil_scores(
+    model: nn.Module,
+    query_input_ids: Tensor,
+    query_attention_mask: Tensor,
+    doc_input_ids: Tensor,  # [B, n_docs_per_query, Ld]
+    doc_attention_mask: Tensor,  # [B, n_docs_per_query, Ld]
+    lambda_t_d: Tensor,
+    lambda_t_q: Tensor,
+    temperature_kl: Tensor,
+    loss_scale: Tensor,
+    *,
+    teacher_scores: Tensor,  # [B, n_docs_per_query]
+    mse_weight: Optional[Tensor] = None,
+    kl_weight: Optional[Tensor] = None,
+    enable_flops_reg: bool = False,
+    rep_grad_clip: Optional[Tensor] = None,
+    step: Optional[int] = None,
+    clip_start_step: int = 0,
+    bf16: bool = False,
+) -> Dict[str, Tensor]:
+    """Distillation-only step: MSE + KL (+ optional FLOPs), no CE/contrastive or anti-zero.
+
+    Uses mixed_distillation_only_loss to compute the combined loss from student representations
+    against teacher scores. Optionally applies FLOPs regularization controlled by enable_flops_reg.
+    """
+    model.train()
+
+    B, n_docs_per_query, Ld = doc_input_ids.shape
+
+    # ---------------- Compute representations -------------------------------
+    doc_input_ids_flat = doc_input_ids.view(B * n_docs_per_query, Ld)
+    doc_attention_flat = doc_attention_mask.view(B * n_docs_per_query, Ld)
+
+    with (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if bf16
+        else nullcontext()
+    ):
+        q_rep: Tensor = model(  # [B, D]
+            input_ids=query_input_ids,
+            attention_mask=query_attention_mask,
+        )
+        d_rep_flat: Tensor = model(  # [(B*n_docs), D]
+            input_ids=doc_input_ids_flat,
+            attention_mask=doc_attention_flat,
+        )
+
+    if bf16:
+        q_rep = q_rep.float()
+        d_rep_flat = d_rep_flat.float()
+
+    # Detach reps for loss computation and manual backward to model
+    q_rep_detached = q_rep.detach().requires_grad_()
+    d_rep_flat_detached = d_rep_flat.detach().requires_grad_()
+
+    # ---------------- Loss computation --------------------------------------
+    total_loss, loss_parts = mixed_distillation_only_loss(
+        q_rep=q_rep_detached,
+        d_rep_flat=d_rep_flat_detached,
+        n_docs_per_query=n_docs_per_query,
+        teacher_scores=teacher_scores,
+        temperature_kl=temperature_kl,
+        mse_weight=mse_weight,
+        kl_weight=kl_weight,
+        enable_flops_reg=enable_flops_reg,
+        lambda_t_q=lambda_t_q,
+        lambda_t_d=lambda_t_d,
+    )
+
+    # ---------------- Backward ----------------------------------------------
+    scaled_loss = total_loss * loss_scale
+    scaled_loss.backward()
+
+    q_grad_norm = q_rep_detached.grad.norm().item() if q_rep_detached.grad is not None else 0.0
+    d_grad_norm = (
+        d_rep_flat_detached.grad.norm().item() if d_rep_flat_detached.grad is not None else 0.0
+    )
+
+    if rep_grad_clip is not None and (step is None or step >= clip_start_step):
+        torch.nn.utils.clip_grad_norm_([q_rep_detached, d_rep_flat_detached], rep_grad_clip)
+
+    # Propagate representation grads back to the model graph
+    q_rep.backward(q_rep_detached.grad)
+    d_rep_flat.backward(d_rep_flat_detached.grad)
+
+    # ---------------- Metrics ------------------------------------------------
     metrics: Dict[str, Tensor] = {"total_loss": total_loss.detach()}
     metrics.update({k: v.detach() for k, v in loss_parts.items()})
     metrics["q_grad_norm"] = q_grad_norm

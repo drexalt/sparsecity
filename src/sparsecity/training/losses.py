@@ -679,3 +679,109 @@ def straight_distil(
     }
 
     return mse_loss, parts
+
+
+def mixed_distillation_only_loss(
+    q_rep: Tensor,  # [B, D]
+    d_rep_flat: Tensor,  # [(B*n_docs), D]
+    n_docs_per_query: int,
+    teacher_scores: Tensor,  # [B, n_docs]
+    temperature_kl: Tensor,
+    *,
+    mse_weight: Optional[Tensor] = None,
+    kl_weight: Optional[Tensor] = None,
+    enable_flops_reg: bool = False,
+    lambda_t_q: Optional[Tensor] = None,
+    lambda_t_d: Optional[Tensor] = None,
+) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Mixed distillation-only loss combining MSE and KL divergence, with optional FLOPs regularization.
+
+    - No contrastive/CE or anti-zero terms.
+    - Requires `teacher_scores` for both KL and MSE (margin) distillation.
+    - If `enable_flops_reg` is True, adds FLOPs regularization using provided lambdas
+      (defaults to zero if lambdas are not provided).
+    """
+
+    device = q_rep.device
+    B, D = q_rep.shape
+
+    # Reshape documents per query
+    d_rep = d_rep_flat.view(B, n_docs_per_query, D)  # [B, n_docs, D]
+
+    # 1) KL divergence distillation (student vs teacher score distributions)
+    kl_loss = kl_divergence_distillation(
+        student_query_embeddings=q_rep,
+        student_doc_embeddings=d_rep,
+        teacher_scores=teacher_scores,
+        temperature_kl=temperature_kl,
+        device=device,
+    )
+    if kl_weight is not None:
+        kl_loss = kl_loss * kl_weight
+
+    # 2) Margin MSE distillation using scores (requires teacher_scores)
+    student_logits = (q_rep.float().unsqueeze(1) * d_rep.float()).sum(-1)  # [B, n_docs]
+    mse_loss = calculate_margin_mse_distillation(
+        student_scores_per_item=student_logits,
+        teacher_scores_per_item=teacher_scores,
+        temperature=temperature_kl,
+        device=device,
+    )
+    if mse_weight is not None:
+        mse_loss = mse_loss * mse_weight
+
+    # 3) Optional FLOPs regularization
+    flops_loss = q_rep.new_tensor(0.0)
+    if enable_flops_reg:
+        flops_loss = calculate_flops_regularization(
+            query_embeddings=q_rep,
+            doc_embeddings=d_rep,
+            lambda_q=lambda_t_q,
+            lambda_d=lambda_t_d,
+        )
+
+    # Diagnostics (sparsity / magnitude)
+    q_abs = q_rep.abs()
+    d_abs = d_rep.abs()
+    is_q_nonzero = q_abs > 1e-9
+    is_d_nonzero = d_abs > 1e-9
+    q_nonzero_vals = q_abs[is_q_nonzero]
+    d_nonzero_vals = d_abs[is_d_nonzero]
+    query_sparsity = (~is_q_nonzero).float().mean()
+    doc_sparsity = (~is_d_nonzero).float().mean()
+    query_min_non_zero = (
+        q_nonzero_vals.min() if q_nonzero_vals.numel() > 0 else q_rep.new_tensor(0.0)
+    )
+    doc_min_non_zero = (
+        d_nonzero_vals.min() if d_nonzero_vals.numel() > 0 else q_rep.new_tensor(0.0)
+    )
+    query_median_non_zero = (
+        torch.median(q_nonzero_vals)
+        if q_nonzero_vals.numel() > 0
+        else q_rep.new_tensor(0.0)
+    )
+    doc_median_non_zero = (
+        torch.median(d_nonzero_vals)
+        if d_nonzero_vals.numel() > 0
+        else q_rep.new_tensor(0.0)
+    )
+    avg_query_non_zero_count = is_q_nonzero.sum() / B
+    avg_doc_non_zero_count = is_d_nonzero.sum() / (B * n_docs_per_query)
+
+    parts: Dict[str, Tensor] = {
+        "kl_loss": kl_loss,
+        "mse_loss": mse_loss,
+        "flops_loss": flops_loss,
+        "query_sparsity": query_sparsity,
+        "doc_sparsity": doc_sparsity,
+        "query_min_non_zero": query_min_non_zero,
+        "doc_min_non_zero": doc_min_non_zero,
+        "query_median_non_zero": query_median_non_zero,
+        "doc_median_non_zero": doc_median_non_zero,
+        "avg_query_non_zero_count": avg_query_non_zero_count,
+        "avg_doc_non_zero_count": avg_doc_non_zero_count,
+    }
+
+    total_loss: Tensor = kl_loss + mse_loss + flops_loss
+    return total_loss, parts
