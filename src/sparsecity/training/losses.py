@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple, Optional, Dict
 from torch import Tensor
+from torch.cuda import temperature
 import torch.nn.functional as F
 
 
@@ -417,6 +418,10 @@ def contrastive_kd_loss_with_hard_negatives(
     )  # [B]
     pos_cols = pos_idx_flat.unsqueeze(1)  # [B, 1]
 
+    is_positive = F.one_hot(pos_idx_flat, num_classes=B * n_docs_per_query).to(
+        dtype=torch.bool
+    )
+
     # Identify indices of hard negatives from the triplet
     # Assuming the first document is positive, and the rest are hard negatives
     hard_neg_indices = []
@@ -483,8 +488,17 @@ def contrastive_kd_loss_with_hard_negatives(
     # Cross-entropy labels: positive always in column 0
     labels_ce = torch.zeros(B, dtype=torch.long, device=device)
 
-    # --- 1. Triplet / contrastive CE loss ------------------------------------
-    triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, temperature_ce)
+    ce_temp_used = temperature_ce
+    if adaptive_ce and logits_ce.size(1) > 1:
+        with torch.no_grad():
+            ce_temp_used = compute_adaptive_ce_temperature(
+                logits_ce,
+                target_gap=ce_target_gap,
+                min_temp=ce_min_temp,
+                max_temp=ce_max_temp,
+                reduce="max",
+            )
+    triplet_loss = calculate_contrastive_loss(logits_ce, labels_ce, ce_temp_used)
     # --- 2. FLOPs regularization ---------------------------------------------
     flops_loss = calculate_flops_regularization(
         query_embeddings=q_rep,
@@ -565,9 +579,7 @@ def contrastive_kd_loss_with_hard_negatives(
         "anti_zero_loss": anti_zero_loss,
         "kl_loss": kl_loss,
         "mse_loss": mse_loss,
-        "ce_temperature": ce_temp_used
-        if isinstance(ce_temp_used, Tensor)
-        else q_rep.new_tensor(float(ce_temp_used)),
+        "ce_temperature": ce_temp_used if ce_temp_used else None,
         # Extra metrics
         "query_sparsity": query_sparsity,
         "doc_sparsity": doc_sparsity,

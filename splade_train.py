@@ -110,37 +110,56 @@ def train_model(splade_model, tokenizer, cfg, dataset):
     # Create optimizer and scheduler
 
     # Separate learning rate for temperatures
-    if cfg.init_ce_temp is not None and cfg.init_kl_temp is not None:
-        temp_params = [splade_model.log_t_ce, splade_model.log_t_kl]
-        other_params = [
-            p
-            for n, p in splade_model.named_parameters()
-            if n not in {"log_t_ce", "log_t_kl"}
-        ]
-
-        optim_param_groups = [
-            {"params": temp_params, "lr": cfg.optimizer.learning_rate},
-            {"params": other_params, "lr": cfg.optimizer.learning_rate},
-        ]
-
-    warmup_steps = cfg.optimizer.warmup_steps
-
-    optimizer = torch.optim.AdamW(
-        optim_param_groups
-        if cfg.init_ce_temp is not None
-        else splade_model.parameters(),
-        lr=cfg.optimizer.learning_rate,
-        weight_decay=cfg.optimizer.weight_decay,
-    )
+    # if cfg.init_ce_temp is not None and cfg.init_kl_temp is not None:
+    #     temp_params = [splade_model.log_t_ce, splade_model.log_t_kl]
+    #     other_params = [
+    #         p
+    #         for n, p in splade_model.named_parameters()
+    #         if n not in {"log_t_ce", "log_t_kl"}
+    #     ]
     #
-    # optimizer = heavyball.ForeachAdamW(
+    #     optim_param_groups = [
+    #         {"params": temp_params, "lr": cfg.optimizer.learning_rate},
+    #         {"params": other_params, "lr": cfg.optimizer.learning_rate},
+    #     ]
+    #
+    warmup_steps = cfg.optimizer.warmup_steps
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p
+                for n, p in splade_model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": cfg.optimizer.weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in splade_model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+    # optimizer = torch.optim.AdamW(
     #     optim_param_groups
     #     if cfg.init_ce_temp is not None
     #     else splade_model.parameters(),
     #     lr=cfg.optimizer.learning_rate,
     #     weight_decay=cfg.optimizer.weight_decay,
-    #     caution=True,
     # )
+    #
+    optimizer = heavyball.ForeachAdamC(
+        optimizer_grouped_parameters,
+        # if cfg.init_ce_temp is not None
+        # else splade_model.parameters(),
+        lr=cfg.optimizer.learning_rate,
+        weight_decay=cfg.optimizer.weight_decay,
+        caution=True,
+        max_lr=cfg.optimizer.learning_rate,
+    )
 
     if cfg.max_length is not None:
         tokenizer.model_max_length = cfg.max_length
@@ -262,12 +281,8 @@ def train_model(splade_model, tokenizer, cfg, dataset):
             document_mask = document_mask.to(device)
             teacher_scores = teacher_scores.to(device) if cfg.use_distillation else None
 
-            lambda_t_d = compute_lambda_exact(
-                cfg.lambda_d, global_step // accum_steps, cfg.T_d
-            )
-            lambda_t_q = compute_lambda_exact(
-                cfg.lambda_q, global_step // accum_steps, cfg.T_q
-            )
+            lambda_t_d = compute_lambda_exact(cfg.lambda_d, global_step, cfg.T_d)
+            lambda_t_q = compute_lambda_exact(cfg.lambda_q, global_step, cfg.T_q)
 
             # optimizer.train()
 
