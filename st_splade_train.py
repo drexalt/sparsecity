@@ -58,40 +58,41 @@ def load_model_name_from_yaml(yaml_path: str) -> str:
     return model_name
 
 
-def _select_negatives_per_row(
-    docs: List[str], scores: List[float], num_negs: int
-) -> List[str]:
-    if not docs:
-        return [""] * num_negs
-    if not scores:
-        # If scores missing, take all except first, pad if needed
-        candidates = docs[1:]
-    else:
-        # Exclude the positive (max score), then sort remaining by score desc
-        pos_idx = max(range(len(scores)), key=lambda i: scores[i])
-        idxs = [i for i in range(len(docs)) if i != pos_idx]
-        # Guard length mismatch
-        if len(scores) != len(docs):
-            # fall back to using docs order if mismatch
-            sorted_negs = [docs[i] for i in idxs]
-        else:
-            sorted_negs = [
-                doc
-                for _, doc in sorted(
-                    ((scores[i], docs[i]) for i in idxs),
-                    key=lambda x: x[0],
-                    reverse=True,
-                )
-            ]
-        candidates = sorted_negs
+def _safe_score(scores: List[float], idx: int, default: float = 0.0) -> float:
+    if isinstance(scores, list) and 0 <= idx < len(scores):
+        value = scores[idx]
+        if value is not None:
+            return float(value)
+    return default
 
-    # Pad/truncate to desired length
-    if len(candidates) < num_negs:
-        pad_val = candidates[-1] if candidates else docs[0]
-        candidates = candidates + [pad_val] * (num_negs - len(candidates))
+
+def _select_negatives_per_row(
+    docs: List[str], scores: List[float], num_negs: int, positive_idx: int
+) -> tuple[List[str], List[float]]:
+    if not docs:
+        return [""] * num_negs, [0.0] * num_negs
+
+    score_aligned = isinstance(scores, list) and len(scores) == len(docs)
+    candidate_indices = [i for i in range(len(docs)) if i != positive_idx]
+
+    if score_aligned:
+        candidate_indices.sort(key=lambda i: scores[i], reverse=True)
+
+    if not candidate_indices:
+        candidate_indices = [positive_idx]
+
+    if len(candidate_indices) < num_negs:
+        last_idx = candidate_indices[-1]
+        candidate_indices.extend([last_idx] * (num_negs - len(candidate_indices)))
     else:
-        candidates = candidates[:num_negs]
-    return candidates
+        candidate_indices = candidate_indices[:num_negs]
+
+    neg_docs = [docs[i] for i in candidate_indices]
+    neg_scores = [
+        float(scores[i]) if score_aligned and scores[i] is not None else 0.0
+        for i in candidate_indices
+    ]
+    return neg_docs, neg_scores
 
 
 def build_train_eval_datasets(
@@ -137,50 +138,53 @@ def build_train_eval_datasets(
 
         positives = []
         negatives_matrix = [[] for _ in range(num_explicit_negatives)]
+        labels = []
 
         for docs, scores in zip(docs_list, scores_list):
             if not isinstance(docs, list) or not docs:
                 positives.append("")
-                for i in range(num_explicit_negatives):
-                    negatives_matrix[i].append("")
+                for negs in negatives_matrix:
+                    negs.append("")
+                labels.append([0.0] * (num_explicit_negatives + 1))
                 continue
 
-            # Positive = highest score (fallback to first doc if scores missing)
+            score_list = scores if isinstance(scores, list) else []
             if (
-                isinstance(scores, list)
-                and len(scores) == len(docs)
-                and len(scores) > 0
+                isinstance(score_list, list)
+                and len(score_list) == len(docs)
+                and len(score_list) > 0
             ):
-                pos_idx = max(range(len(scores)), key=lambda i: scores[i])
+                pos_idx = max(range(len(score_list)), key=lambda i: score_list[i])
             else:
                 pos_idx = 0
 
             positives.append(docs[pos_idx])
-            negs = _select_negatives_per_row(
-                docs, scores if isinstance(scores, list) else [], num_explicit_negatives
+            neg_docs, neg_scores = _select_negatives_per_row(
+                docs, score_list, num_explicit_negatives, pos_idx
             )
-            for i, neg in enumerate(negs):
+            for i, neg in enumerate(neg_docs):
                 negatives_matrix[i].append(neg)
 
-        output = {"query": qs, "positive": positives}
-        for i, col in enumerate(negative_cols):
-            output[col] = negatives_matrix[i]
-        return output
+            positive_score = _safe_score(score_list, pos_idx)
+            labels.append([positive_score, *neg_scores])
+
+        output = {"query": qs, "positive": positives, "label": labels}
 
     mapped = train_proc.map(to_triplets, batched=True)
 
     # Keep only the columns in the expected order so the collator/loss interpret correctly
-    ordered_cols = ["query", "positive", *negative_cols]
+    ordered_cols = ["query", "positive", *negative_cols, "label"]
     keep_cols = [c for c in ordered_cols if c in mapped.column_names]
     mapped = mapped.select_columns(keep_cols)
 
-    # Filter empty rows
     def _row_ok(ex):
         if not ex["query"] or not ex["positive"]:
             return False
         for col in negative_cols:
             if col in ex and not ex[col]:
                 return False
+        if "label" not in ex or len(ex["label"]) != num_explicit_negatives + 1:
+            return False
         return True
 
     mapped = mapped.filter(_row_ok)
