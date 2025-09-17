@@ -174,20 +174,23 @@ def build_train_eval_datasets(
 
     # Keep only the columns in the expected order so the collator/loss interpret correctly
     ordered_cols = ["query", "positive", *negative_cols, "label"]
-    keep_cols = [c for c in ordered_cols if c in mapped.column_names]
-    mapped = mapped.select_columns(keep_cols)
 
     def _row_ok(ex):
-        if not ex["query"] or not ex["positive"]:
+        if not ex.get("query") or not ex.get("positive"):
             return False
         for col in negative_cols:
-            if col in ex and not ex[col]:
+            neg = ex.get(col)
+            if not neg:
                 return False
-        if "label" not in ex or len(ex["label"]) != num_explicit_negatives + 1:
+        label = ex.get("label")
+        if label is None or len(label) != num_explicit_negatives + 1:
             return False
         return True
 
     mapped = mapped.filter(_row_ok)
+
+    keep_cols = [c for c in ordered_cols if c in mapped.column_names]
+    mapped = mapped.select_columns(keep_cols)
 
     # Optionally subsample for quick test runs
     if max_train_samples is not None and len(mapped) > max_train_samples:
