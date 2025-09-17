@@ -29,9 +29,14 @@ from sentence_transformers import (
     SparseEncoderTrainingArguments,
 )
 from sentence_transformers.sparse_encoder import evaluation, losses
+from sentence_transformers.sparse_encoder.callbacks import (
+    SpladeRegularizerWeightSchedulerCallback,
+)
 from sentence_transformers.sparse_encoder.models import MLMTransformer, SpladePooling
 from sentence_transformers.training_args import BatchSamplers
 from transformers import get_wsd_schedule
+from torch import Tensor
+from torch import nn
 
 # Reuse your KDProcessing transform to create 'query', 'documents', 'scores'
 from src.sparsecity.data.dataset import KDProcessing
@@ -207,6 +212,37 @@ def build_train_eval_datasets(
     return train_dataset, eval_dataset
 
 
+class SparseDistillMarginCombinedLoss(nn.Module):
+    def __init__(
+        self,
+        model: SparseEncoder,
+        distill_temperature: float = 1.0,
+        distill_weight: float = 1.0,
+        margin_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.distill = losses.SparseDistillKLDivLoss(
+            model, temperature=distill_temperature
+        )
+        self.margin = losses.SparseMarginMSELoss(model)
+        self.distill_weight = distill_weight
+        self.margin_weight = margin_weight
+
+    def compute_loss_from_embeddings(
+        self, embeddings: List[Tensor], labels: Tensor
+    ) -> dict[str, Tensor]:
+        distill_loss = (
+            self.distill.compute_loss_from_embeddings(embeddings, labels)
+            * self.distill_weight
+        )
+        margin_loss = (
+            self.margin.compute_loss_from_embeddings(embeddings, labels)
+            * self.margin_weight
+        )
+        return {"distill_kl_loss": distill_loss, "margin_mse_loss": margin_loss}
+
+
 def main():
     # Hyperparameters for a quick trial
     train_batch_size = 4
@@ -216,6 +252,8 @@ def main():
     document_regularizer_weight = 9e-4
     max_seq_length = 256
     num_explicit_negatives = 8
+    regularizer_scheduler_type = "quadratic"
+    regularizer_warmup_ratio = 0
 
     # Load HF model name from your conf/model/neo.yaml
     model_yaml_path = os.path.join("conf", "model", "neo.yaml")
@@ -257,7 +295,7 @@ def main():
     # 3) Define SPLADE loss with in-batch negatives ranking (plus explicit negatives)
     loss = losses.SpladeLoss(
         model=model,
-        loss=losses.SparseMultipleNegativesRankingLoss(model=model),
+        loss=SparseDistillMarginCombinedLoss(model=model),
         query_regularizer_weight=query_regularizer_weight,
         document_regularizer_weight=document_regularizer_weight,
     )
@@ -298,7 +336,15 @@ def main():
 
     args.set_lr_scheduler("cosine")
 
-    # 6) Create the trainer & train
+    callbacks = []
+    callbacks.append(
+        SpladeRegularizerWeightSchedulerCallback(
+            loss=loss,
+            scheduler_type=regularizer_scheduler_type,
+            warmup_ratio=regularizer_warmup_ratio,
+        )
+    )
+
     trainer = SparseEncoderTrainer(
         model=model,
         args=args,
@@ -306,6 +352,7 @@ def main():
         eval_dataset=eval_dataset,
         loss=loss,
         evaluator=evaluator,
+        callbacks=callbacks or None,
     )
     trainer.train()
 
