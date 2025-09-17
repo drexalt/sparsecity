@@ -58,7 +58,7 @@ def load_model_name_from_yaml(yaml_path: str) -> str:
     return model_name
 
 
-def _safe_score(scores: List[float], idx: int, default: float = 0.0) -> float:
+def _safe_score(scores: list[float], idx: int, default: float = 0.0) -> float:
     if isinstance(scores, list) and 0 <= idx < len(scores):
         value = scores[idx]
         if value is not None:
@@ -67,8 +67,8 @@ def _safe_score(scores: List[float], idx: int, default: float = 0.0) -> float:
 
 
 def _select_negatives_per_row(
-    docs: List[str], scores: List[float], num_negs: int, positive_idx: int
-) -> tuple[List[str], List[float]]:
+    docs: list[str], scores: list[float], num_negs: int, positive_idx: int
+) -> tuple[list[str], list[float]]:
     if not docs:
         return [""] * num_negs, [0.0] * num_negs
 
@@ -149,11 +149,7 @@ def build_train_eval_datasets(
                 continue
 
             score_list = scores if isinstance(scores, list) else []
-            if (
-                isinstance(score_list, list)
-                and len(score_list) == len(docs)
-                and len(score_list) > 0
-            ):
+            if score_list and len(score_list) == len(docs):
                 pos_idx = max(range(len(score_list)), key=lambda i: score_list[i])
             else:
                 pos_idx = 0
@@ -169,6 +165,9 @@ def build_train_eval_datasets(
             labels.append([positive_score, *neg_scores])
 
         output = {"query": qs, "positive": positives, "label": labels}
+        for i, col in enumerate(negative_cols):
+            output[col] = negatives_matrix[i]
+        return output
 
     mapped = train_proc.map(to_triplets, batched=True)
 
