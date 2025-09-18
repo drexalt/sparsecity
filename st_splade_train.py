@@ -221,6 +221,45 @@ def build_train_eval_datasets(
     return train_dataset, eval_dataset
 
 
+class SparseAntiZeroLoss(nn.Module):
+    """
+    Penalises batches whose SPLADE activations collapse to zero.
+    Computes 1/(sum(query)^2) + 1/(sum(docs)^2) and leaves weighting to the caller.
+    """
+
+    def __init__(self, model: SparseEncoder, epsilon: float = 1e-12) -> None:
+        super().__init__()
+        self.model = model
+        self.epsilon = epsilon
+
+    def forward(
+        self, sentence_features: List[dict[str, Tensor]], labels: Tensor | None = None
+    ) -> Tensor:
+        raise AttributeError(
+            "SparseAntiZeroLoss should not be used alone. Call compute_loss_from_embeddings within SpladeLoss/CSRLoss."
+        )
+
+    def compute_loss_from_embeddings(
+        self, embeddings: List[Tensor], labels: Tensor | None = None
+    ) -> Tensor:
+        if not embeddings:
+            raise ValueError("SparseAntiZeroLoss received no embeddings.")
+
+        query_embeddings = embeddings[0]
+        document_embeddings = (
+            torch.cat(embeddings[1:], dim=0)
+            if len(embeddings) > 1
+            else query_embeddings
+        )
+
+        eps = self.epsilon
+        query_sum = torch.sum(query_embeddings) + eps
+        doc_sum = torch.sum(document_embeddings) + eps
+
+        loss = (1.0 / (query_sum**2)) + (1.0 / (doc_sum**2))
+        return loss
+
+
 class SparseDistillMarginCombinedLoss(nn.Module):
     def __init__(
         self,
@@ -228,6 +267,8 @@ class SparseDistillMarginCombinedLoss(nn.Module):
         distill_temperature: float = 2.0,
         distill_weight: float = 1.0,
         margin_weight: float = 0.05,
+        anti_zero_weight: float = 0.0,
+        anti_zero_epsilon: float = 1e-12,
     ) -> None:
         super().__init__()
         self.model = model
@@ -235,21 +276,30 @@ class SparseDistillMarginCombinedLoss(nn.Module):
             model, temperature=distill_temperature
         )
         self.margin = losses.SparseMarginMSELoss(model)
+        self.anti_zero = SparseAntiZeroLoss(model, epsilon=anti_zero_epsilon)
         self.distill_weight = distill_weight
         self.margin_weight = margin_weight
+        self.anti_zero_weight = anti_zero_weight
 
     def compute_loss_from_embeddings(
         self, embeddings: List[Tensor], labels: Tensor
     ) -> dict[str, Tensor]:
-        distill_loss = (
+        losses_dict = {}
+        losses_dict["distill_kl_loss"] = (
             self.distill.compute_loss_from_embeddings(embeddings, labels)
             * self.distill_weight
         )
-        margin_loss = (
+        losses_dict["margin_mse_loss"] = (
             self.margin.compute_loss_from_embeddings(embeddings, labels)
             * self.margin_weight
         )
-        return {"distill_kl_loss": distill_loss, "margin_mse_loss": margin_loss}
+        if self.anti_zero_weight > 0:
+            anti_zero = (
+                self.anti_zero.compute_loss_from_embeddings(embeddings, labels)
+                * self.anti_zero_weight
+            )
+            losses_dict["anti_zero_loss"] = anti_zero
+        return losses_dict
 
 
 def main():
@@ -264,6 +314,7 @@ def main():
     num_explicit_negatives = 8
     regularizer_scheduler_type = "quadratic"
     regularizer_warmup_ratio = 0.6
+    anti_zero_weight = 0.5
 
     # Load HF model name from your conf/model/neo.yaml
     model_yaml_path = os.path.join("conf", "model", "neo.yaml")
@@ -309,7 +360,9 @@ def main():
     # 3) Define SPLADE loss with in-batch negatives ranking (plus explicit negatives)
     loss = losses.SpladeLoss(
         model=model,
-        loss=SparseDistillMarginCombinedLoss(model=model),
+        loss=SparseDistillMarginCombinedLoss(
+            model=model, anti_zero_weight=anti_zero_weight
+        ),
         query_regularizer_weight=query_regularizer_weight,
         document_regularizer_weight=document_regularizer_weight,
     )
