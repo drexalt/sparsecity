@@ -17,6 +17,7 @@ Note on collators & negatives:
 import logging
 import os
 import traceback
+import random
 from typing import List
 
 import yaml
@@ -32,6 +33,9 @@ from sentence_transformers.sparse_encoder import evaluation, losses
 from sentence_transformers.sparse_encoder.callbacks import (
     SpladeRegularizerWeightSchedulerCallback,
 )
+from sentence_transformers.sparse_encoder.data_collator import (
+    SparseEncoderDataCollator,
+)
 from sentence_transformers.sparse_encoder.models import MLMTransformer, SpladePooling
 from sentence_transformers.training_args import BatchSamplers
 from transformers import get_wsd_schedule
@@ -40,6 +44,7 @@ from torch import nn
 import torch
 import math
 from datetime import datetime
+from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
 
 # Reuse your KDProcessing transform to create 'query', 'documents', 'scores'
 from src.sparsecity.data.dataset import KDProcessing
@@ -110,7 +115,9 @@ def build_train_eval_datasets(
     - Splits into train/eval.
     """
     logging.info("Loading LightOn MS MARCO datasets...")
-    train_raw = load_dataset("lightonai/ms-marco-en-bge-gemma", "train", split="train")
+    train_raw = load_dataset(
+        "lightonai/ms-marco-en-bge-gemma", "train_unormalized", split="train"
+    )
     queries = load_dataset("lightonai/ms-marco-en-bge-gemma", "queries", split="train")
     documents = load_dataset(
         "lightonai/ms-marco-en-bge-gemma", "documents", split="train"
@@ -142,6 +149,10 @@ def build_train_eval_datasets(
         positives = []
         negatives_matrix = [[] for _ in range(num_explicit_negatives)]
         labels = []
+        # Store full pool for random negative selection at collator time
+        all_negatives = []
+        all_neg_scores = []
+        pos_scores = []
 
         for docs, scores in zip(docs_list, scores_list):
             if not isinstance(docs, list) or not docs:
@@ -167,7 +178,26 @@ def build_train_eval_datasets(
             positive_score = _safe_score(score_list, pos_idx)
             labels.append([positive_score, *neg_scores])
 
-        output = {"query": qs, "positive": positives, "label": labels}
+            # Full negative pool (excluding the positive) for dynamic sampling
+            pool_docs = [d for i, d in enumerate(docs) if i != pos_idx]
+            if score_list and len(score_list) == len(docs):
+                pool_scores = [
+                    float(score_list[i]) for i in range(len(docs)) if i != pos_idx
+                ]
+            else:
+                pool_scores = [0.0] * len(pool_docs)
+            all_negatives.append(pool_docs)
+            all_neg_scores.append(pool_scores)
+            pos_scores.append(positive_score)
+
+        output = {
+            "query": qs,
+            "positive": positives,
+            "label": labels,
+            "all_negatives": all_negatives,
+            "all_neg_scores": all_neg_scores,
+            "pos_score": pos_scores,
+        }
         for i, col in enumerate(negative_cols):
             output[col] = negatives_matrix[i]
         return output
@@ -175,7 +205,15 @@ def build_train_eval_datasets(
     mapped = train_proc.map(to_triplets, batched=True)
 
     # Keep only the columns in the expected order so the collator/loss interpret correctly
-    ordered_cols = ["query", "positive", *negative_cols, "label"]
+    ordered_cols = [
+        "query",
+        "positive",
+        *negative_cols,
+        "label",
+        "all_negatives",
+        "all_neg_scores",
+        "pos_score",
+    ]
 
     def _row_ok(ex):
         if not ex.get("query") or not ex.get("positive"):
@@ -219,6 +257,83 @@ def build_train_eval_datasets(
         logging.info(eval_dataset)
 
     return train_dataset, eval_dataset
+
+
+class RandomNegativesCollator(SparseEncoderDataCollator):
+    """
+    Collator that randomly samples k negatives per example from the stored full pool and
+    rebuilds the (query, positive, negative_i..., label) batch before tokenization.
+    """
+
+    def __init__(
+        self,
+        *args,
+        negatives_per_sample: int = 8,
+        seed: int = 42,
+        allow_replacement: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.negatives_per_sample = negatives_per_sample
+        self.allow_replacement = allow_replacement
+        self._base_seed = seed
+        self._rng = random.Random(seed)
+
+    def set_epoch_seed(self, epoch_seed: int) -> None:
+        self._rng = random.Random(epoch_seed)
+
+    def _sample_indices(self, n: int, k: int) -> list[int]:
+        if n <= 0:
+            return []
+        if k <= n and not self.allow_replacement:
+            return self._rng.sample(range(n), k)
+        # Not enough items or replacement allowed → sample with replacement
+        return [self._rng.randrange(n) for _ in range(k)]
+
+    def __call__(self, features: list[dict]) -> dict:
+        k = self.negatives_per_sample
+        processed: list[dict] = []
+
+        for ex in features:
+            negs = ex.get("all_negatives") or []
+            neg_scores = ex.get("all_neg_scores") or []
+            pos_score = ex.get("pos_score", 0.0)
+
+            idxs = self._sample_indices(len(negs), k)
+            if idxs:
+                chosen_negs = [negs[i] for i in idxs]
+                chosen_scores = (
+                    [neg_scores[i] for i in idxs] if neg_scores else [0.0] * k
+                )
+            else:
+                chosen_negs = [""] * k
+                chosen_scores = [0.0] * k
+
+            row = {
+                "query": ex["query"],
+                "positive": ex["positive"],
+                "label": [pos_score, *chosen_scores],
+            }
+            for i in range(k):
+                row[f"negative_{i + 1}"] = chosen_negs[i]
+            processed.append(row)
+
+        # Let the base collator tokenize and pack
+        return super().__call__(processed)
+
+
+class RandomNegativesReseedCallback(TrainerCallback):
+    def __init__(self, data_collator: RandomNegativesCollator, base_seed: int = 42):
+        super().__init__()
+        self.data_collator = data_collator
+        self.base_seed = base_seed
+
+    def on_epoch_begin(
+        self, args, state: TrainerState, control: TrainerControl, **kwargs
+    ):
+        # Change RNG each epoch but keep runs reproducible
+        epoch_idx = int(state.epoch or 0)
+        self.data_collator.set_epoch_seed(self.base_seed + epoch_idx)
 
 
 class SparseAntiZeroLoss(nn.Module):
@@ -430,6 +545,19 @@ def main():
         )
     )
 
+    # Random negatives collator & reseeding per epoch
+    data_collator = RandomNegativesCollator(
+        tokenize_fn=model.tokenize,
+        negatives_per_sample=num_explicit_negatives,
+        seed=args.seed,
+        router_mapping=args.router_mapping,
+        prompts=args.prompts,
+        all_special_ids=set(model.tokenizer.all_special_ids)
+        if hasattr(model, "tokenizer") and hasattr(model.tokenizer, "all_special_ids")
+        else set(),
+    )
+    callbacks.append(RandomNegativesReseedCallback(data_collator, base_seed=args.seed))
+
     trainer = SparseEncoderTrainer(
         model=model,
         args=args,
@@ -437,6 +565,7 @@ def main():
         eval_dataset=eval_dataset,
         loss=loss,
         evaluator=evaluator,
+        data_collator=data_collator,
         callbacks=callbacks or None,
         optimizers=(optimizer, scheduler),
     )
