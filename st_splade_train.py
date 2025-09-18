@@ -37,6 +37,9 @@ from sentence_transformers.training_args import BatchSamplers
 from transformers import get_wsd_schedule
 from torch import Tensor
 from torch import nn
+import torch
+import math
+from datetime import datetime
 
 # Reuse your KDProcessing transform to create 'query', 'documents', 'scores'
 from src.sparsecity.data.dataset import KDProcessing
@@ -222,9 +225,9 @@ class SparseDistillMarginCombinedLoss(nn.Module):
     def __init__(
         self,
         model: SparseEncoder,
-        distill_temperature: float = 1.0,
+        distill_temperature: float = 2.0,
         distill_weight: float = 1.0,
-        margin_weight: float = 1.0,
+        margin_weight: float = 0.05,
     ) -> None:
         super().__init__()
         self.model = model
@@ -252,14 +255,15 @@ class SparseDistillMarginCombinedLoss(nn.Module):
 def main():
     # Hyperparameters for a quick trial
     train_batch_size = 4
-    num_epochs = 3
-    learning_rate = 4e-5
-    query_regularizer_weight = 2e-4
-    document_regularizer_weight = 9e-4
+    num_epochs = 2
+    learning_rate = 2e-5
+    weight_decay = 0.05
+    query_regularizer_weight = 0.0000004
+    document_regularizer_weight = 0.000001
     max_seq_length = 256
     num_explicit_negatives = 8
     regularizer_scheduler_type = "quadratic"
-    regularizer_warmup_ratio = 0
+    regularizer_warmup_ratio = 0.6
 
     # Load HF model name from your conf/model/neo.yaml
     model_yaml_path = os.path.join("conf", "model", "neo.yaml")
@@ -285,6 +289,10 @@ def main():
             model_name=f"splade-{short_model_name} trained on LightOn MS MARCO (triplets)",
         ),
     )
+    # model = SparseEncoder(
+    #     "models/splade-NeoBERT-RetroMAE-pretrain-lighton-msmarco-triplets/checkpoint-10200/",
+    #     trust_remote_code=True,
+    # )
     logging.info(
         "Using explicit MLMTransformer+SpladePooling. Model max length: %s",
         model.max_seq_length,
@@ -313,7 +321,10 @@ def main():
     )
 
     # 5) Training arguments
-    run_name = f"splade-{short_model_name}-lighton-msmarco-triplets"
+    run_name_base = f"splade-{short_model_name}-lighton-msmarco-triplets-distill"
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{run_name_base}-{timestamp}"
     args = SparseEncoderTrainingArguments(
         # Required parameter:
         output_dir=f"models/{run_name}",
@@ -321,8 +332,6 @@ def main():
         num_train_epochs=num_epochs,
         per_device_train_batch_size=train_batch_size,
         per_device_eval_batch_size=train_batch_size,
-        learning_rate=learning_rate,
-        warmup_ratio=0.2,
         fp16=False,  # Set to False if you get an error that your GPU can't run on FP16
         bf16=True,  # Set to True if you have a GPU that supports BF16
         gradient_accumulation_steps=16,
@@ -334,14 +343,31 @@ def main():
         eval_steps=300,
         save_strategy="steps",
         save_steps=300,
-        save_total_limit=2,
+        save_total_limit=3,
         logging_steps=10,
         run_name=run_name,  # Used by W&B if installed
         seed=42,
     )
 
-    args.set_lr_scheduler("cosine")
+    # Optimizer
+    #
+    #
+    steps_per_epoch = math.ceil(len(train_dataset) / train_batch_size)
+    updates_per_epoch = math.ceil(steps_per_epoch / args.gradient_accumulation_steps)
+    total_updates = updates_per_epoch * num_epochs
 
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    scheduler = get_wsd_schedule(
+        optimizer,
+        num_training_steps=total_updates,
+        num_warmup_steps=round(total_updates * 0.1),
+        num_decay_steps=round(total_updates * 0.5),
+    )
     callbacks = []
     callbacks.append(
         SpladeRegularizerWeightSchedulerCallback(
@@ -359,6 +385,7 @@ def main():
         loss=loss,
         evaluator=evaluator,
         callbacks=callbacks or None,
+        optimizers=(optimizer, scheduler),
     )
     trainer.train()
 
