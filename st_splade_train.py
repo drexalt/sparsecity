@@ -352,14 +352,14 @@ def main():
     # Hyperparameters for a quick trial
     train_batch_size = 4
     num_epochs = 2
-    learning_rate = 2e-5
+    learning_rate = 0.00008
     weight_decay = 0.05
-    query_regularizer_weight = 0.0000004
-    document_regularizer_weight = 0.000001
+    query_regularizer_weight = 0.001
+    document_regularizer_weight = 0.005
     max_seq_length = 256
     num_explicit_negatives = 8
     regularizer_scheduler_type = "quadratic"
-    regularizer_warmup_ratio = 0.6
+    regularizer_warmup_ratio = 0.3
     anti_zero_weight = 0.5
 
     # Load HF model name from your conf/model/neo.yaml
@@ -416,9 +416,7 @@ def main():
     # 3) Define SPLADE loss with in-batch negatives ranking (plus explicit negatives)
     loss = losses.SpladeLoss(
         model=model,
-        loss=SparseDistillMarginCombinedLoss(
-            model=model, anti_zero_weight=anti_zero_weight
-        ),
+        loss=losses.SparseMultipleNegativesRankingLoss(model=model),
         query_regularizer_weight=query_regularizer_weight,
         document_regularizer_weight=document_regularizer_weight,
     )
@@ -430,7 +428,7 @@ def main():
     )
 
     # 5) Training arguments
-    run_name_base = f"splade-{short_model_name}-lighton-msmarco-triplets-distill"
+    run_name_base = f"splade-{short_model_name}-lighton-msmarco-triplets"
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = f"{run_name_base}-{timestamp}"
@@ -441,6 +439,9 @@ def main():
         num_train_epochs=num_epochs,
         per_device_train_batch_size=train_batch_size,
         per_device_eval_batch_size=train_batch_size,
+        dataloader_num_workers=4,
+        dataloader_drop_last=True,
+        dataloader_prefetch_factor=2,
         fp16=False,  # Set to False if you get an error that your GPU can't run on FP16
         bf16=True,  # Set to True if you have a GPU that supports BF16
         gradient_accumulation_steps=16,
@@ -466,9 +467,7 @@ def main():
     total_updates = updates_per_epoch * num_epochs
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
     )
 
     scheduler = get_wsd_schedule(
@@ -523,16 +522,16 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # # 9) Optional: push to hub
-    # try:
-    #     model.push_to_hub(run_name)
-    # except Exception:
-    #     logging.error(
-    #         "Error uploading model to the Hugging Face Hub:\n%sTo upload it manually, run `huggingface-cli login`, then:\n"
-    #         "  model = SparseEncoder(%r)\n  model.push_to_hub('%s')",
-    #         traceback.format_exc(),
-    #         final_output_dir,
-    #         run_name,
-    #     )
+    try:
+        model.push_to_hub(run_name)
+    except Exception:
+        logging.error(
+            "Error uploading model to the Hugging Face Hub:\n%sTo upload it manually, run `huggingface-cli login`, then:\n"
+            "  model = SparseEncoder(%r)\n  model.push_to_hub('%s')",
+            traceback.format_exc(),
+            final_output_dir,
+            run_name,
+        )
 
 
 if __name__ == "__main__":
