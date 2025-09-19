@@ -124,133 +124,37 @@ def build_train_eval_datasets(
     )
 
     logging.info(
-        "Materializing KDProcessing (adds 'query', 'documents', 'scores') via map()..."
+        "Materializing KDProcessing (adds 'query', 'documents', 'scores') via set_transform() (lazy)..."
     )
     processor = KDProcessing(queries=queries, documents=documents)
-    # Apply the non-lazy map so downstream map/filter see the new columns reliably
-    train_proc = train_raw.map(
-        processor.map,
-        batched=False,
-        remove_columns=train_raw.column_names,
-    )
+    # Lazily add query/documents/scores at read-time to avoid heavy mapping
+    train_raw.set_transform(processor.transform)
 
-    logging.info(
-        "Converting to (query, positive, negatives[1..%d]) columns...",
-        num_explicit_negatives,
-    )
+    dataset = train_raw
 
-    negative_cols = [f"negative_{i + 1}" for i in range(num_explicit_negatives)]
-
-    def to_triplets(batch):
-        qs = batch["query"]
-        docs_list = batch["documents"]
-        scores_list = batch["scores"]
-
-        positives = []
-        negatives_matrix = [[] for _ in range(num_explicit_negatives)]
-        labels = []
-        # Store full pool for random negative selection at collator time
-        all_negatives = []
-        all_neg_scores = []
-        pos_scores = []
-
-        for docs, scores in zip(docs_list, scores_list):
-            if not isinstance(docs, list) or not docs:
-                positives.append("")
-                for negs in negatives_matrix:
-                    negs.append("")
-                labels.append([0.0] * (num_explicit_negatives + 1))
-                continue
-
-            score_list = scores if isinstance(scores, list) else []
-            if score_list and len(score_list) == len(docs):
-                pos_idx = max(range(len(score_list)), key=lambda i: score_list[i])
-            else:
-                pos_idx = 0
-
-            positives.append(docs[pos_idx])
-            neg_docs, neg_scores = _select_negatives_per_row(
-                docs, score_list, num_explicit_negatives, pos_idx
-            )
-            for i, neg in enumerate(neg_docs):
-                negatives_matrix[i].append(neg)
-
-            positive_score = _safe_score(score_list, pos_idx)
-            labels.append([positive_score, *neg_scores])
-
-            # Full negative pool (excluding the positive) for dynamic sampling
-            pool_docs = [d for i, d in enumerate(docs) if i != pos_idx]
-            if score_list and len(score_list) == len(docs):
-                pool_scores = [
-                    float(score_list[i]) for i in range(len(docs)) if i != pos_idx
-                ]
-            else:
-                pool_scores = [0.0] * len(pool_docs)
-            all_negatives.append(pool_docs)
-            all_neg_scores.append(pool_scores)
-            pos_scores.append(positive_score)
-
-        output = {
-            "query": qs,
-            "positive": positives,
-            "label": labels,
-            "all_negatives": all_negatives,
-            "all_neg_scores": all_neg_scores,
-            "pos_score": pos_scores,
-        }
-        for i, col in enumerate(negative_cols):
-            output[col] = negatives_matrix[i]
-        return output
-
-    mapped = train_proc.map(to_triplets, batched=True)
-
-    # Keep only the columns in the expected order so the collator/loss interpret correctly
-    ordered_cols = [
-        "query",
-        "positive",
-        *negative_cols,
-        "label",
-        "all_negatives",
-        "all_neg_scores",
-        "pos_score",
-    ]
-
-    def _row_ok(ex):
-        if not ex.get("query") or not ex.get("positive"):
-            return False
-        for col in negative_cols:
-            neg = ex.get(col)
-            if not neg:
-                return False
-        label = ex.get("label")
-        if label is None or len(label) != num_explicit_negatives + 1:
-            return False
-        return True
-
-    mapped = mapped.filter(_row_ok)
-
-    keep_cols = [c for c in ordered_cols if c in mapped.column_names]
-    mapped = mapped.select_columns(keep_cols)
-
-    # Optionally subsample for quick test runs
-    if max_train_samples is not None and len(mapped) > max_train_samples:
+    # Optionally subsample for quick test runs (reapply transform on the view)
+    if max_train_samples is not None and len(dataset) > max_train_samples:
         logging.info(
             "Subsampling to first %d training samples for quick test.",
             max_train_samples,
         )
-        mapped = mapped.select(range(max_train_samples))
+        dataset = dataset.select(range(max_train_samples))
+        dataset.set_transform(processor.transform)
 
     # Split into train/eval
     if eval_size:
-        eval_size = min(eval_size, max(1000, int(0.05 * len(mapped))))
-        dataset_dict = mapped.train_test_split(
+        eval_size = min(eval_size, max(1000, int(0.05 * len(dataset))))
+        dataset_dict = dataset.train_test_split(
             test_size=eval_size, seed=seed, shuffle=True
         )
         train_dataset = dataset_dict["train"]
         eval_dataset = dataset_dict["test"]
+        train_dataset.set_transform(processor.transform)
+        eval_dataset.set_transform(processor.transform)
     else:
-        train_dataset = mapped
+        train_dataset = dataset
         eval_dataset = None
+        train_dataset.set_transform(processor.transform)
 
     logging.info(train_dataset)
     if eval_dataset is not None:
@@ -295,23 +199,50 @@ class RandomNegativesCollator(SparseEncoderDataCollator):
         processed: list[dict] = []
 
         for ex in features:
-            negs = ex.get("all_negatives") or []
-            neg_scores = ex.get("all_neg_scores") or []
-            pos_score = ex.get("pos_score", 0.0)
+            qs = ex.get("query", "")
+            docs = ex.get("documents") or []
+            scores = ex.get("scores") or []
 
-            idxs = self._sample_indices(len(negs), k)
+            if not isinstance(docs, list) or len(docs) == 0:
+                pos_text = ""
+                pos_score = 0.0
+                pool_docs: list[str] = []
+                pool_scores: list[float] = []
+            else:
+                if (
+                    isinstance(scores, list)
+                    and len(scores) == len(docs)
+                    and len(scores) > 0
+                ):
+                    pos_idx = max(range(len(scores)), key=lambda i: scores[i])
+                    pos_score = float(scores[pos_idx])
+                else:
+                    pos_idx = 0
+                    pos_score = 0.0
+                pos_text = docs[pos_idx]
+                pool_docs = [d for i, d in enumerate(docs) if i != pos_idx]
+                if (
+                    isinstance(scores, list)
+                    and len(scores) == len(docs)
+                    and len(scores) > 0
+                ):
+                    pool_scores = [
+                        float(scores[i]) for i in range(len(docs)) if i != pos_idx
+                    ]
+                else:
+                    pool_scores = [0.0] * len(pool_docs)
+
+            idxs = self._sample_indices(len(pool_docs), k)
             if idxs:
-                chosen_negs = [negs[i] for i in idxs]
-                chosen_scores = (
-                    [neg_scores[i] for i in idxs] if neg_scores else [0.0] * k
-                )
+                chosen_negs = [pool_docs[i] for i in idxs]
+                chosen_scores = [pool_scores[i] for i in idxs]
             else:
                 chosen_negs = [""] * k
                 chosen_scores = [0.0] * k
 
             row = {
-                "query": ex["query"],
-                "positive": ex["positive"],
+                "query": qs,
+                "positive": pos_text,
                 "label": [pos_score, *chosen_scores],
             }
             for i in range(k):
@@ -453,6 +384,7 @@ def main():
             language="en",
             license="apache-2.0",
             model_name=f"splade-{short_model_name} trained on LightOn MS MARCO (triplets)",
+            generate_widget_examples=False,
         ),
     )
     # model = SparseEncoder(
@@ -471,6 +403,15 @@ def main():
         eval_size=10_000,
         seed=42,
     )
+
+    # Prevent model card widget example generation from iterating a lazily-transformed dataset with non-string columns
+    # which can break `set_transform` assumptions during select_columns.
+    if hasattr(model, "model_card_data") and model.model_card_data is not None:
+        try:
+            if not getattr(model.model_card_data, "widget", None):
+                model.model_card_data.widget = [{"text": "placeholder"}]
+        except Exception:
+            pass
 
     # 3) Define SPLADE loss with in-batch negatives ranking (plus explicit negatives)
     loss = losses.SpladeLoss(
