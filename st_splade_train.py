@@ -50,6 +50,47 @@ from transformers.trainer_callback import TrainerCallback, TrainerControl, Train
 from src.sparsecity.data.dataset import KDProcessing
 
 
+from torch.profiler import (
+    profile,
+    schedule,
+    ProfilerActivity,
+    tensorboard_trace_handler,
+)
+from transformers.trainer_callback import TrainerCallback
+
+
+class ProfCB(TrainerCallback):
+    def __init__(self, start_step=11, active_steps=3, logdir="profiles"):
+        self.start_step = start_step
+        self.active_steps = active_steps
+        self.logdir = logdir
+        self.prof = None
+        self._end = None
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.prof is None and state.global_step == self.start_step:
+            self.prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(wait=3, warmup=1, active=self.active_steps, repeat=1),
+                on_trace_ready=tensorboard_trace_handler(self.logdir),
+                record_shapes=True,
+                profile_memory=True,
+            )
+            print("profiling started")
+            self.prof.__enter__()
+            self._end = self.start_step + 1 + self.active_steps  # warmup(1) + active
+            print(f"End step: {self._end}")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.prof:
+            self.prof.step()
+            print("stepped")
+            if state.global_step >= self._end:
+                print("Ended!")
+                self.prof.__exit__(None, None, None)
+                self.prof = None
+
+
 logging.basicConfig(
     format="%(asctime)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -484,6 +525,7 @@ def main():
             warmup_ratio=regularizer_warmup_ratio,
         )
     )
+    callbacks.append(ProfCB())
 
     # Random negatives collator & reseeding per epoch
     data_collator = RandomNegativesCollator(
