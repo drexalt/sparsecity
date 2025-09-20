@@ -56,39 +56,60 @@ from torch.profiler import (
     ProfilerActivity,
     tensorboard_trace_handler,
 )
-from transformers.trainer_callback import TrainerCallback
 
 
 class ProfCB(TrainerCallback):
-    def __init__(self, start_step=11, active_steps=3, logdir="profiles"):
-        self.start_step = start_step
-        self.active_steps = active_steps
+    """
+    Profile N active *batches* starting at a chosen batch index.
+    Works regardless of gradient accumulation size.
+    """
+
+    def __init__(self, start_batch=5, active_batches=3, logdir="profiles"):
+        self.start_batch = start_batch
+        self.active_batches = active_batches
         self.logdir = logdir
         self.prof = None
-        self._end = None
+        self.batch_idx = 0
+        self._last_step = None
 
-    def on_step_begin(self, args, state, control, **kwargs):
-        if self.prof is None and state.global_step == self.start_step:
+    def on_train_begin(self, args, state, control, **kwargs):
+        # optional: make each run write to its own subdir
+        self.logdir = os.path.join(self.logdir, getattr(args, "run_name", "run"))
+
+    def on_train_batch_begin(self, args, state, control, **kwargs):
+        # Called for *every batch*, not just optimizer steps.
+        if self.prof is None and self.batch_idx == self.start_batch:
             self.prof = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=schedule(wait=3, warmup=1, active=self.active_steps, repeat=1),
+                schedule=schedule(
+                    wait=3, warmup=1, active=self.active_batches, repeat=1
+                ),
                 on_trace_ready=tensorboard_trace_handler(self.logdir),
                 record_shapes=True,
                 profile_memory=True,
+                with_stack=True,  # helpful in ST + HF stacks
             )
-            print("profiling started")
+            print(f"[profiler] started at batch {self.batch_idx}")
             self.prof.__enter__()
-            self._end = self.start_step + 1 + self.active_steps  # warmup(1) + active
-            print(f"End step: {self._end}")
 
-    def on_step_end(self, args, state, control, **kwargs):
-        if self.prof:
+    def on_train_batch_end(self, args, state, control, **kwargs):
+        # Step the profiler every *batch* so the schedule advances.
+        if self.prof is not None:
             self.prof.step()
-            print("stepped")
-            if state.global_step >= self._end:
-                print("Ended!")
+            # End when we've advanced through wait+warmup+active
+            steps_since_start = self.batch_idx - self.start_batch + 1
+            total_sched = 3 + 1 + self.active_batches  # wait + warmup + active
+            if steps_since_start >= total_sched:
+                print(f"[profiler] stopping at batch {self.batch_idx}")
                 self.prof.__exit__(None, None, None)
                 self.prof = None
+        self.batch_idx += 1
+
+    def on_train_end(self, args, state, control, **kwargs):
+        # Safety: close if still open
+        if self.prof is not None:
+            self.prof.__exit__(None, None, None)
+            self.prof = None
 
 
 logging.basicConfig(
