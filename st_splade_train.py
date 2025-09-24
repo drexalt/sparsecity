@@ -48,7 +48,7 @@ from transformers.trainer_callback import TrainerCallback, TrainerControl, Train
 
 # Reuse your KDProcessing transform to create 'query', 'documents', 'scores'
 from src.sparsecity.data.dataset import KDProcessing
-
+import heavyball
 
 from torch.profiler import (
     profile,
@@ -60,56 +60,65 @@ from torch.profiler import (
 
 class ProfCB(TrainerCallback):
     """
-    Profile N active *batches* starting at a chosen batch index.
-    Works regardless of gradient accumulation size.
+    Profiles *substeps* (each accumulation micro-batch).
+    - Start immediately at train begin
+    - Use schedule(wait=<start_batches>, warmup=1, active=<active_batches>)
+    - Advance the schedule on every substep
+    This avoids relying on on_train_batch_* which SparseEncoderTrainer may not call.
     """
 
-    def __init__(self, start_batch=5, active_batches=3, logdir="profiles"):
-        self.start_batch = start_batch
-        self.active_batches = active_batches
+    def __init__(self, start_batches=2, active_batches=2, logdir="profiles"):
+        self.start_batches = int(start_batches)
+        self.active_batches = int(active_batches)
         self.logdir = logdir
         self.prof = None
-        self.batch_idx = 0
-        self._last_step = None
+        self._steps_advanced = 0
+        self._total_sched = 3 + 1 + self.active_batches  # wait + warmup + active
+        self._started = False
+
+    def _activities(self):
+        acts = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            acts.append(ProfilerActivity.CUDA)
+        return acts
 
     def on_train_begin(self, args, state, control, **kwargs):
-        # optional: make each run write to its own subdir
-        self.logdir = os.path.join(self.logdir, getattr(args, "run_name", "run"))
+        run_dir = os.path.join(self.logdir, getattr(args, "run_name", "run"))
+        os.makedirs(run_dir, exist_ok=True)
+        self.prof = profile(
+            activities=self._activities(),
+            schedule=schedule(
+                wait=self.start_batches, warmup=1, active=self.active_batches, repeat=1
+            ),
+            on_trace_ready=tensorboard_trace_handler(run_dir),
+            record_shapes=False,
+            profile_memory=True,
+            with_stack=False,
+        )
+        self.prof.__enter__()
+        self._started = True
+        print(
+            f"[profiler] initialized (wait={self.start_batches}, warmup=1, active={self.active_batches}) → {run_dir}"
+        )
 
-    def on_train_batch_begin(self, args, state, control, **kwargs):
-        # Called for *every batch*, not just optimizer steps.
-        if self.prof is None and self.batch_idx == self.start_batch:
-            self.prof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=schedule(
-                    wait=3, warmup=1, active=self.active_batches, repeat=1
-                ),
-                on_trace_ready=tensorboard_trace_handler(self.logdir),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,  # helpful in ST + HF stacks
-            )
-            print(f"[profiler] started at batch {self.batch_idx}")
-            self.prof.__enter__()
-
-    def on_train_batch_end(self, args, state, control, **kwargs):
-        # Step the profiler every *batch* so the schedule advances.
-        if self.prof is not None:
+    def on_substep_end(self, args, state, control, **kwargs):
+        # Called once per accumulation micro-batch; advance the profiler schedule here.
+        if self._started and self.prof is not None:
             self.prof.step()
-            # End when we've advanced through wait+warmup+active
-            steps_since_start = self.batch_idx - self.start_batch + 1
-            total_sched = 3 + 1 + self.active_batches  # wait + warmup + active
-            if steps_since_start >= total_sched:
-                print(f"[profiler] stopping at batch {self.batch_idx}")
+            self._steps_advanced += 1
+            # Stop after we've progressed through wait+warmup+active windows
+            if self._steps_advanced >= (self.start_batches + 1 + self.active_batches):
+                print("[profiler] stopping")
                 self.prof.__exit__(None, None, None)
                 self.prof = None
-        self.batch_idx += 1
+                self._started = False
 
     def on_train_end(self, args, state, control, **kwargs):
         # Safety: close if still open
         if self.prof is not None:
             self.prof.__exit__(None, None, None)
             self.prof = None
+            self._started = False
 
 
 logging.basicConfig(
@@ -412,16 +421,16 @@ class SparseDistillMarginCombinedLoss(nn.Module):
 
 def main():
     # Hyperparameters for a quick trial
-    train_batch_size = 4
-    num_epochs = 2
-    learning_rate = 0.00008
-    weight_decay = 0.05
-    query_regularizer_weight = 0.001
-    document_regularizer_weight = 0.005
+    train_batch_size = 8
+    num_epochs = 8
+    learning_rate = 0.0001
+    weight_decay = 0.01
+    query_regularizer_weight = 0.0015
+    document_regularizer_weight = 0.002
     max_seq_length = 256
-    num_explicit_negatives = 8
+    num_explicit_negatives = 1
     regularizer_scheduler_type = "quadratic"
-    regularizer_warmup_ratio = 0.3
+    regularizer_warmup_ratio = 0.1
     anti_zero_weight = 0.5
 
     # Load HF model name from your conf/model/neo.yaml
@@ -438,6 +447,7 @@ def main():
         max_seq_length=max_seq_length,
         model_args={"trust_remote_code": True},
         config_args={"trust_remote_code": True},
+        tokenizer_args={"padding": "max_length"},
     )
     splade_pool = SpladePooling(pooling_strategy="max")
     model = SparseEncoder(
@@ -450,7 +460,7 @@ def main():
         ),
     )
     # model = SparseEncoder(
-    #     "models/splade-NeoBERT-RetroMAE-pretrain-lighton-msmarco-triplets/checkpoint-10200/",
+    #     "models/splade-NeoBERT-RetroMAE-pretrain-lighton-msmarco-triplets-20250922-022819/checkpoint-24300",
     #     trust_remote_code=True,
     # )
     logging.info(
@@ -461,7 +471,7 @@ def main():
     # 2) Build datasets: keep your KDProcessing setup; expand to explicit negatives columns
     train_dataset, eval_dataset = build_train_eval_datasets(
         num_explicit_negatives=num_explicit_negatives,
-        max_train_samples=400_000,
+        max_train_samples=800_000,
         eval_size=10_000,
         seed=42,
     )
@@ -512,9 +522,9 @@ def main():
         metric_for_best_model="eval_NanoBEIR_mean_dot_ndcg@10",
         # Optional tracking/debugging parameters:
         eval_strategy="steps",
-        eval_steps=300,
+        eval_steps=900,
         save_strategy="steps",
-        save_steps=300,
+        save_steps=900,
         save_total_limit=3,
         logging_steps=10,
         run_name=run_name,  # Used by W&B if installed
@@ -528,15 +538,39 @@ def main():
     updates_per_epoch = math.ceil(steps_per_epoch / args.gradient_accumulation_steps)
     total_updates = updates_per_epoch * num_epochs
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    # optimizer = torch.optim.AdamW(
+    #     model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
+    # )
+    optimizer = heavyball.ForeachMuon(
+        params=optimizer_grouped_parameters, lr=learning_rate, weight_decay=weight_decay
     )
 
     scheduler = get_wsd_schedule(
         optimizer,
         num_training_steps=total_updates,
-        num_warmup_steps=round(total_updates * 0.1),
-        num_decay_steps=round(total_updates * 0.5),
+        num_warmup_steps=round(total_updates * 0.05),
+        num_decay_steps=round(total_updates * 0.2),
+        min_lr_ratio=0.2,
     )
     callbacks = []
     callbacks.append(
@@ -546,11 +580,13 @@ def main():
             warmup_ratio=regularizer_warmup_ratio,
         )
     )
-    callbacks.append(ProfCB())
+    # callbacks.append(ProfCB())
 
     # Random negatives collator & reseeding per epoch
     data_collator = RandomNegativesCollator(
-        tokenize_fn=model.tokenize,
+        tokenize_fn=lambda texts, task=None: model.tokenize(
+            texts, task=task, padding="max_length"
+        ),
         negatives_per_sample=num_explicit_negatives,
         seed=args.seed,
         router_mapping=args.router_mapping,
@@ -585,16 +621,17 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # # 9) Optional: push to hub
-    try:
-        model.push_to_hub(run_name)
-    except Exception:
-        logging.error(
-            "Error uploading model to the Hugging Face Hub:\n%sTo upload it manually, run `huggingface-cli login`, then:\n"
-            "  model = SparseEncoder(%r)\n  model.push_to_hub('%s')",
-            traceback.format_exc(),
-            final_output_dir,
-            run_name,
-        )
+    # try:
+    #     model.push_to_hub(run_name)
+    # except Exception:
+    #     logging.error(
+    #         "Error uploading model to the Hugging Face Hub:\n%sTo upload it manually, run `huggingface-cli login`, then:\n"
+    #         "  model = SparseEncoder(%r)\n  model.push_to_hub('%s')",
+    #         traceback.format_exc(),
+    #         final_output_dir,
+    #         run_name,
+    #     )
+    #
 
 
 if __name__ == "__main__":
