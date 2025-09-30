@@ -423,14 +423,14 @@ def main():
     # Hyperparameters for a quick trial
     train_batch_size = 8
     num_epochs = 8
-    learning_rate = 0.0001
+    learning_rate = 0.000065
     weight_decay = 0.01
-    query_regularizer_weight = 0.0015
-    document_regularizer_weight = 0.002
+    query_regularizer_weight = 0.0008
+    document_regularizer_weight = 0.0009
     max_seq_length = 256
     num_explicit_negatives = 1
     regularizer_scheduler_type = "quadratic"
-    regularizer_warmup_ratio = 0.1
+    regularizer_warmup_ratio = 0.15
     anti_zero_weight = 0.5
 
     # Load HF model name from your conf/model/neo.yaml
@@ -569,7 +569,7 @@ def main():
         optimizer,
         num_training_steps=total_updates,
         num_warmup_steps=round(total_updates * 0.05),
-        num_decay_steps=round(total_updates * 0.2),
+        num_decay_steps=round(total_updates * 0.4),
         min_lr_ratio=0.2,
     )
     callbacks = []
