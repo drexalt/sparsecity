@@ -419,6 +419,50 @@ class SparseDistillMarginCombinedLoss(nn.Module):
         return losses_dict
 
 
+class SparseDistillMarginRankingCombinedLoss(nn.Module):
+    """
+    Combines KL distillation, margin MSE, and sparse multiple negatives ranking losses.
+    Each component contributes according to its respective weight.
+    """
+
+    def __init__(
+        self,
+        model: SparseEncoder,
+        distill_temperature: float = 2.0,
+        distill_weight: float = 1.0,
+        margin_weight: float = 0.05,
+        ranking_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.distill = losses.SparseDistillKLDivLoss(
+            model, temperature=distill_temperature
+        )
+        self.margin = losses.SparseMarginMSELoss(model)
+        self.ranking = losses.SparseMultipleNegativesRankingLoss(model)
+        self.distill_weight = distill_weight
+        self.margin_weight = margin_weight
+        self.ranking_weight = ranking_weight
+
+    def compute_loss_from_embeddings(
+        self, embeddings: List[Tensor], labels: Tensor
+    ) -> dict[str, Tensor]:
+        losses_dict = {}
+        losses_dict["distill_kl_loss"] = (
+            self.distill.compute_loss_from_embeddings(embeddings, labels)
+            * self.distill_weight
+        )
+        losses_dict["margin_mse_loss"] = (
+            self.margin.compute_loss_from_embeddings(embeddings, labels)
+            * self.margin_weight
+        )
+        losses_dict["sparse_mnr_loss"] = (
+            self.ranking.compute_loss_from_embeddings(embeddings, labels)
+            * self.ranking_weight
+        )
+        return losses_dict
+
+
 def main():
     # Hyperparameters for a quick trial
     train_batch_size = 8
