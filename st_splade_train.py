@@ -18,7 +18,8 @@ import logging
 import os
 import traceback
 import random
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Tuple
 
 import yaml
 from datasets import load_dataset, Dataset
@@ -336,6 +337,205 @@ class RandomNegativesReseedCallback(TrainerCallback):
         # Change RNG each epoch but keep runs reproducible
         epoch_idx = int(state.epoch or 0)
         self.data_collator.set_epoch_seed(self.base_seed + epoch_idx)
+
+
+_EMBED_OUTPUT_HINTS = (
+    "embedding",
+    "embeddings",
+    "lm_head",
+    "classifier",
+    "output",
+    "decoder",
+    "pooler",
+)
+
+
+@dataclass
+class HybridParamGroups:
+    muon: List[nn.Parameter] = field(default_factory=list)
+    muon_names: List[str] = field(default_factory=list)
+    adamw_decay: List[nn.Parameter] = field(default_factory=list)
+    adamw_decay_names: List[str] = field(default_factory=list)
+    adamw_no_decay: List[nn.Parameter] = field(default_factory=list)
+    adamw_no_decay_names: List[str] = field(default_factory=list)
+    fused_qkv_param_names: List[str] = field(default_factory=list)
+
+    def summary_string(self) -> str:
+        return (
+            f"Hybrid optimizer split -> Muon: {len(self.muon)} params "
+            f"(+{len(self.fused_qkv_param_names)} fused QKV hints), "
+            f"AdamW decay: {len(self.adamw_decay)}, "
+            f"AdamW no_decay: {len(self.adamw_no_decay)}"
+        )
+
+
+def _should_use_adamw(param_name: str, param: nn.Parameter) -> bool:
+    if param.ndim < 2:
+        return True
+    lowered = param_name.lower()
+    return any(hint in lowered for hint in _EMBED_OUTPUT_HINTS)
+
+
+def _is_fused_qkv_weight(param_name: str, param: nn.Parameter) -> bool:
+    lowered = param_name.lower()
+    if "qkv" in lowered or "in_proj_weight" in lowered:
+        if param.ndim == 2 and param.shape[0] % 3 == 0:
+            return True
+    return False
+
+
+def collect_hybrid_param_groups(
+    model: nn.Module,
+    no_decay_terms: Iterable[str],
+) -> HybridParamGroups:
+    groups = HybridParamGroups()
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if _should_use_adamw(name, parameter):
+            if any(term in name for term in no_decay_terms):
+                groups.adamw_no_decay.append(parameter)
+                groups.adamw_no_decay_names.append(name)
+            else:
+                groups.adamw_decay.append(parameter)
+                groups.adamw_decay_names.append(name)
+            continue
+        if _is_fused_qkv_weight(name, parameter):
+            groups.fused_qkv_param_names.append(name)
+        groups.muon.append(parameter)
+        groups.muon_names.append(name)
+    return groups
+
+
+class HybridMuonAdamW:
+    """
+    Lightweight wrapper that drives Muon and AdamW optimizers in lockstep so the
+    Trainer can treat them as a single optimizer instance.
+    """
+
+    def __init__(
+        self,
+        muon_optimizer: torch.optim.Optimizer | None,
+        adamw_optimizer: torch.optim.Optimizer | None,
+    ) -> None:
+        self.muon = muon_optimizer
+        self.adamw = adamw_optimizer
+        self.param_groups = []
+        if self.muon is not None:
+            self.param_groups.extend(self.muon.param_groups)
+        if self.adamw is not None:
+            self.param_groups.extend(self.adamw.param_groups)
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        if self.muon is not None:
+            self.muon.zero_grad(set_to_none=set_to_none)
+        if self.adamw is not None:
+            self.adamw.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        if self.muon is not None:
+            self.muon.step()
+        if self.adamw is not None:
+            self.adamw.step()
+        return loss
+
+    def state_dict(self) -> Dict[str, Dict]:
+        state = {}
+        if self.muon is not None:
+            state["muon"] = self.muon.state_dict()
+        if self.adamw is not None:
+            state["adamw"] = self.adamw.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Dict]) -> None:
+        if self.muon is not None and "muon" in state_dict:
+            self.muon.load_state_dict(state_dict["muon"])
+        if self.adamw is not None and "adamw" in state_dict:
+            self.adamw.load_state_dict(state_dict["adamw"])
+
+
+class CompositeLRScheduler:
+    """
+    Forwards LR scheduler calls to each underlying scheduler (Muon + AdamW).
+    """
+
+    def __init__(self, schedulers: Iterable) -> None:
+        self.schedulers = [
+            scheduler for scheduler in schedulers if scheduler is not None
+        ]
+        self.optimizer = self.schedulers[0].optimizer if self.schedulers else None
+
+    def step(self) -> None:
+        for scheduler in self.schedulers:
+            scheduler.step()
+
+    def state_dict(self) -> List[Dict]:
+        return [scheduler.state_dict() for scheduler in self.schedulers]
+
+    def load_state_dict(self, state_dicts: List[Dict]) -> None:
+        for scheduler, state in zip(self.schedulers, state_dicts):
+            scheduler.load_state_dict(state)
+
+
+def create_hybrid_optimizers(
+    model: nn.Module,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+    muon_learning_rate: float | None = None,
+    no_decay_terms: Iterable[str] = ("bias", "LayerNorm.weight"),
+    muon_kwargs: Dict | None = None,
+    adamw_kwargs: Dict | None = None,
+) -> tuple[
+    HybridMuonAdamW,
+    torch.optim.Optimizer | None,
+    torch.optim.Optimizer | None,
+    HybridParamGroups,
+]:
+    """
+    Builds Muon + AdamW optimizers with parameter splits that ensure:
+      - 2D transformer weights go to Muon
+      - Embedding layers, classifier heads, and scalar/vector params stay on AdamW
+    Returns (hybrid_wrapper, muon_optimizer, adamw_optimizer, grouping_metadata).
+    """
+
+    muon_kwargs = dict(muon_kwargs or {})
+    adamw_kwargs = dict(adamw_kwargs or {})
+
+    groups = collect_hybrid_param_groups(model, no_decay_terms=no_decay_terms)
+
+    muon_optimizer: torch.optim.Optimizer | None = None
+    if groups.muon:
+        muon_lr = muon_kwargs.pop("lr", muon_learning_rate or learning_rate)
+        muon_optimizer = heavyball.ForeachMuon(
+            params=[{"params": groups.muon}],
+            lr=muon_lr,
+            **muon_kwargs,
+        )
+
+    adamw_optimizer: torch.optim.Optimizer | None = None
+    adamw_param_groups: List[Dict] = []
+    if groups.adamw_decay:
+        adamw_param_groups.append(
+            {"params": groups.adamw_decay, "weight_decay": weight_decay}
+        )
+    if groups.adamw_no_decay:
+        adamw_param_groups.append(
+            {"params": groups.adamw_no_decay, "weight_decay": 0.0}
+        )
+    if adamw_param_groups:
+        adamw_lr = adamw_kwargs.pop("lr", learning_rate)
+        adamw_optimizer = torch.optim.AdamW(
+            adamw_param_groups,
+            lr=adamw_lr,
+            **adamw_kwargs,
+        )
+
+    hybrid = HybridMuonAdamW(muon_optimizer, adamw_optimizer)
+    return hybrid, muon_optimizer, adamw_optimizer, groups
 
 
 class SparseAntiZeroLoss(nn.Module):
