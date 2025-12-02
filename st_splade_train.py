@@ -475,6 +475,11 @@ class CompositeLRScheduler:
     def state_dict(self) -> List[Dict]:
         return [scheduler.state_dict() for scheduler in self.schedulers]
 
+    def get_last_lr(self) -> list[float]:
+        if not self.schedulers:
+            return []
+        return self.schedulers[0].get_last_lr()
+
     def load_state_dict(self, state_dicts: List[Dict]) -> None:
         for scheduler, state in zip(self.schedulers, state_dicts):
             scheduler.load_state_dict(state)
@@ -665,48 +670,50 @@ class SparseDistillMarginRankingCombinedLoss(nn.Module):
 
 def main():
     # Hyperparameters for a quick trial
-    train_batch_size = 8
+    train_batch_size = 6
     num_epochs = 8
-    learning_rate = 0.000065
-    weight_decay = 0.01
-    query_regularizer_weight = 0.0008
-    document_regularizer_weight = 0.0009
+    learning_rate = 0.000005
+    weight_decay = 0.04
+    query_regularizer_weight = 0.04
+    document_regularizer_weight = 0.02
     max_seq_length = 256
-    num_explicit_negatives = 1
+    num_explicit_negatives = 8
     regularizer_scheduler_type = "quadratic"
-    regularizer_warmup_ratio = 0.15
-    anti_zero_weight = 0.5
+    regularizer_warmup_ratio = 0.05
+    anti_zero_weight = 0.25
+    kl_temperature = 1.0
 
     # Load HF model name from your conf/model/neo.yaml
-    model_yaml_path = os.path.join("conf", "model", "neo.yaml")
-    model_name = load_model_name_from_yaml(model_yaml_path)
-    short_model_name = model_name.split("/")[-1]
+    # model_yaml_path = os.path.join("conf", "model", "neo.yaml")
+    # model_name = load_model_name_from_yaml(model_yaml_path)
+    # short_model_name = model_name.split("/")[-1]
+    short_model_name = "neobert-stage2"
 
     # 1) Define SparseEncoder model
     # Force SPLADE path by explicitly building MLMTransformer + SpladePooling
     # and override tokenizer to use BERT (NeoBERT uses BERT tokenizer but may not register it).
-    mlm = MLMTransformer(
-        model_name_or_path=model_name,
-        tokenizer_name_or_path="bert-base-uncased",  # Fallback tokenizer for NeoBERT
-        max_seq_length=max_seq_length,
-        model_args={"trust_remote_code": True},
-        config_args={"trust_remote_code": True},
-        tokenizer_args={"padding": "max_length"},
-    )
-    splade_pool = SpladePooling(pooling_strategy="max")
-    model = SparseEncoder(
-        modules=[mlm, splade_pool],
-        model_card_data=SparseEncoderModelCardData(
-            language="en",
-            license="apache-2.0",
-            model_name=f"splade-{short_model_name} trained on LightOn MS MARCO (triplets)",
-            generate_widget_examples=False,
-        ),
-    )
-    # model = SparseEncoder(
-    #     "models/splade-NeoBERT-RetroMAE-pretrain-lighton-msmarco-triplets-20250922-022819/checkpoint-24300",
-    #     trust_remote_code=True,
+    # mlm = MLMTransformer(
+    #     model_name_or_path=model_name,
+    #     tokenizer_name_or_path="bert-base-uncased",  # Fallback tokenizer for NeoBERT
+    #     max_seq_length=max_seq_length,
+    #     model_args={"trust_remote_code": True},
+    #     config_args={"trust_remote_code": True},
+    #     tokenizer_args={"padding": "max_length"},
     # )
+    # splade_pool = SpladePooling(pooling_strategy="max")
+    # model = SparseEncoder(
+    #     modules=[mlm, splade_pool],
+    #     model_card_data=SparseEncoderModelCardData(
+    #         language="en",
+    #         license="apache-2.0",
+    #         model_name=f"splade-{short_model_name} trained on LightOn MS MARCO (triplets)",
+    #         generate_widget_examples=False,
+    #     ),
+    # )
+    model = SparseEncoder(
+        "drexalt/splade-NeoBERT-msmarco-triplets-muon",
+        trust_remote_code=True,
+    )
     logging.info(
         "Using explicit MLMTransformer+SpladePooling. Model max length: %s",
         model.max_seq_length,
@@ -732,7 +739,11 @@ def main():
     # 3) Define SPLADE loss with in-batch negatives ranking (plus explicit negatives)
     loss = losses.SpladeLoss(
         model=model,
-        loss=losses.SparseMultipleNegativesRankingLoss(model=model),
+        loss=SparseDistillMarginCombinedLoss(
+            model=model,
+            anti_zero_weight=anti_zero_weight,
+            distill_temperature=kl_temperature,
+        ),
         query_regularizer_weight=query_regularizer_weight,
         document_regularizer_weight=document_regularizer_weight,
     )
@@ -744,7 +755,7 @@ def main():
     )
 
     # 5) Training arguments
-    run_name_base = f"splade-{short_model_name}-lighton-msmarco-triplets"
+    run_name_base = f"splade-{short_model_name}-adam/muon-8-distill"
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = f"{run_name_base}-{timestamp}"
@@ -760,15 +771,15 @@ def main():
         dataloader_prefetch_factor=2,
         fp16=False,  # Set to False if you get an error that your GPU can't run on FP16
         bf16=True,  # Set to True if you have a GPU that supports BF16
-        gradient_accumulation_steps=16,
+        gradient_accumulation_steps=12,
         batch_sampler=BatchSamplers.NO_DUPLICATES,  # In-batch negatives benefit from no duplicates
         load_best_model_at_end=True,
         metric_for_best_model="eval_NanoBEIR_mean_dot_ndcg@10",
         # Optional tracking/debugging parameters:
         eval_strategy="steps",
-        eval_steps=900,
+        eval_steps=600,
         save_strategy="steps",
-        save_steps=900,
+        save_steps=600,
         save_total_limit=3,
         logging_steps=10,
         run_name=run_name,  # Used by W&B if installed
@@ -781,6 +792,10 @@ def main():
     steps_per_epoch = math.ceil(len(train_dataset) / train_batch_size)
     updates_per_epoch = math.ceil(steps_per_epoch / args.gradient_accumulation_steps)
     total_updates = updates_per_epoch * num_epochs
+
+    muon_learning_rate = learning_rate * 10
+    num_warmup_steps = round(total_updates * 0.1)
+    num_decay_steps = round(total_updates * 0.7)
 
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
@@ -802,20 +817,47 @@ def main():
         },
     ]
 
-    # optimizer = torch.optim.AdamW(
-    #     model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
+    # optimizer = heavyball.ForeachPSGDKron(
+    #     params=optimizer_grouped_parameters, lr=learning_rate, weight_decay=weight_decay
     # )
-    optimizer = heavyball.ForeachMuon(
-        params=optimizer_grouped_parameters, lr=learning_rate, weight_decay=weight_decay
+    # optimizer = heavyball.ForeachMuon(
+    #     params=optimizer_grouped_parameters, lr=learning_rate, weight_decay=weight_decay
+    # )
+    #
+    # optimizer = torch.optim.AdamW(
+    #     params=optimizer_grouped_parameters, lr=learning_rate, weight_decay=weight_decay
+    # )
+    #
+    hybrid_opt, adamw, muon, params = create_hybrid_optimizers(
+        model,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        muon_learning_rate=muon_learning_rate,
+    )
+    # scheduler = get_wsd_schedule(
+    #     optimizer,
+    #     num_training_steps=total_updates,
+    #     num_warmup_steps=round(total_updates * 0.15),
+    #     num_decay_steps=round(total_updates * 0.70),
+    #     min_lr_ratio=0.4,
+    # )
+    #
+    muon_scheduler = get_wsd_schedule(
+        muon,
+        num_training_steps=total_updates,
+        num_warmup_steps=num_warmup_steps,
+        num_decay_steps=num_decay_steps,
+        min_lr_ratio=0.3,
+    )
+    adamw_scheduler = get_wsd_schedule(
+        adamw,
+        num_training_steps=total_updates,
+        num_warmup_steps=num_warmup_steps,
+        num_decay_steps=num_decay_steps,
+        min_lr_ratio=0.3,
     )
 
-    scheduler = get_wsd_schedule(
-        optimizer,
-        num_training_steps=total_updates,
-        num_warmup_steps=round(total_updates * 0.05),
-        num_decay_steps=round(total_updates * 0.4),
-        min_lr_ratio=0.2,
-    )
+    scheduler = CompositeLRScheduler(schedulers=[muon_scheduler, adamw_scheduler])
     callbacks = []
     callbacks.append(
         SpladeRegularizerWeightSchedulerCallback(
@@ -850,7 +892,7 @@ def main():
         evaluator=evaluator,
         data_collator=data_collator,
         callbacks=callbacks or None,
-        optimizers=(optimizer, scheduler),
+        optimizers=(hybrid_opt, scheduler),
     )
     trainer.train()
 
